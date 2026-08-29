@@ -295,6 +295,17 @@ impl BrewEntity {
     }
 
     fn resync_subscribers(&self) {
+        // ПРАВКА R2BMP: объявляем синтетического абонента при каждом подключении.
+        if let (Ok(i), Ok(g)) = (std::env::var("BLUESTATION_FAKE_ISSI"), std::env::var("BLUESTATION_FAKE_GSSI")) {
+            if let Ok(issi) = i.trim().parse::<u32>() {
+                let groups: Vec<u32> = g.split(char::from(44)).filter_map(|x| x.trim().parse::<u32>().ok()).collect();
+                if !groups.is_empty() {
+                    tracing::warn!("BrewEntity: СИНТЕТИЧЕСКИЙ абонент issi={} группы={:?}", issi, groups);
+                    let _ = self.command_sender.send(BrewCommand::RegisterSubscriber { issi });
+                    let _ = self.command_sender.send(BrewCommand::AffiliateGroups { issi, groups });
+                }
+            }
+        }
         for (issi, groups) in &self.subscriber_groups {
             if !super::is_brew_issi_routable(&self.config, *issi) {
                 tracing::debug!("BrewEntity: resync skipping issi={} (filtered)", issi);

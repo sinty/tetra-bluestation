@@ -402,7 +402,14 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     });
                 }
                 BrewMessage::Error(err) => {
-                    tracing::warn!("BrewWorker: server error type={}: {} bytes", err.error_type, err.data.len());
+                    // Печатаем содержимое отказа, а не только тип и длину: без этого
+                    // причину приходится реконструировать по косвенным признакам.
+                    let as_text = String::from_utf8_lossy(&err.data);
+                    let as_hex: String = err.data.iter().map(|b| format!("{:02x} ", b)).collect();
+                    tracing::warn!(
+                        "BrewWorker: server error type={}: {} bytes | text={:?} | hex={}",
+                        err.error_type, err.data.len(), as_text, as_hex.trim_end()
+                    );
                     // TODO FIXME we could check whether this call is indeed a brew ssi here
                     let _ = self.event_sender.send(BrewEvent::ServerError {
                         error_type: err.error_type,

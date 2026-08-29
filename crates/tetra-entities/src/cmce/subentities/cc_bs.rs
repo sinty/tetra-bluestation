@@ -216,6 +216,13 @@ impl CcBsSubentity {
     }
 
     fn has_listener(&self, gssi: u32) -> bool {
+        // ПРАВКА R2BMP: синтетический слушатель из BLUESTATION_FAKE_GSSI.
+        // Даёт принимать групповые вызовы из сети без зарегистрированных раций.
+        if let Ok(v) = std::env::var("BLUESTATION_FAKE_GSSI") {
+            if v.split(char::from(44)).filter_map(|g| g.trim().parse::<u32>().ok()).any(|g| g == gssi) {
+                return true;
+            }
+        }
         self.group_listeners.get(&gssi).copied().unwrap_or(0) > 0
     }
 
