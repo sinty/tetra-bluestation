@@ -1,0 +1,22 @@
+// Панели tetra-dash разрешено запускать и останавливать ровно один юнит.
+//
+// Почему polkit, а не sudo: у пользователя claude общий NOPASSWD-доступ,
+// поэтому снять NoNewPrivileges с юнита панели означало бы отдать ей root
+// целиком. polkit работает через D-Bus, закалку снимать не нужно.
+//
+// Здесь только manage-units (пуск/останов). manage-unit-files (enable/disable)
+// намеренно НЕ выдаётся: он не проверяется по конкретному юниту, то есть был бы
+// властью над всеми юнитами сразу. Состояние «нужна ли станция после
+// перезагрузки» хранится флаговым файлом, его панель пишет своими правами.
+
+polkit.addRule(function (action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        subject.user === "claude" &&
+        action.lookup("unit") === "bluestation-bs.service") {
+
+        var verb = action.lookup("verb");
+        if (verb === "start" || verb === "stop" || verb === "restart") {
+            return polkit.Result.YES;
+        }
+    }
+});

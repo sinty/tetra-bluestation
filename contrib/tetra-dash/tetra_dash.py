@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+"""
+tetra-dash — панель наблюдения и управления базовой станцией TETRA.
+
+Три сервера в одном процессе:
+
+  :9001  телеметрия   сабпротокол bluestation-telemetry-v1   станция -> мы
+  :9002  управление   сабпротокол bluestation-control-v1     мы <-> станция
+  :8088  браузер      HTML + WebSocket /ws
+
+Станция подключается к нам сама: в её конфигурации секции [telemetry]
+и [command] задают host/port, а слушаем здесь мы. Кадры бинарные, внутри JSON —
+внешне тегированные enum'ы serde, например {"MsRegistration":{"issi":1234567}}.
+
+Телеметрия отдаёт всего четыре события (регистрация, дерегистрация, привязка
+и отвязка групп). Этого мало для полезной панели, поэтому состояние Brew
+и групповые вызовы дочитываются из журнала systemd — источник каждой строки
+показан в интерфейсе, чтобы структурные данные не путались с разбором текста.
+
+Все адреса, пароли и идентификаторы — в /etc/tetra-lab.conf.
+"""
+
+import asyncio
+import base64
+import hmac
+import json
+import os
+import re
+import secrets
+import shlex
+import sys
+import time
+from collections import deque
+
+from websockets.asyncio.server import serve
+from websockets.datastructures import Headers
+from websockets.http11 import Response
+
+CONF_PATH = os.environ.get("TETRA_LAB_CONF", "/etc/tetra-lab.conf")
+
+TELEMETRY_PROTOCOL = "bluestation-telemetry-v1"
+CONTROL_PROTOCOL = "bluestation-control-v1"
+
+MAX_EVENTS = 300
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
+def load_conf(path):
+    """Читает файл присваиваний shell. Полноценный разбор не нужен:
+    формат намеренно простой, чтобы его читали и sh, и Python."""
+    conf = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if not key.isidentifier():
+                    continue
+                try:
+                    parts = shlex.split(value, comments=True)
+                except ValueError:
+                    continue
+                conf[key] = parts[0] if parts else ""
+    except OSError as e:
+        print(f"tetra-dash: не читается {path}: {e}", file=sys.stderr)
+    return conf
+
+
+CONF = load_conf(CONF_PATH)
+
+
+def cfg(key, default=""):
+    return CONF.get(key, default)
+
+
+def cfg_int(key, default):
+    try:
+        return int(CONF.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+NOTIFY_URL = cfg("NOTIFY_URL")
+NOTIFY_PREFIX = cfg("NOTIFY_PREFIX")
+STATION_UNIT = cfg("STATION_UNIT", "bluestation-bs.service")
+STATION_FLAG = cfg("STATION_FLAG", "/var/lib/tetra-lab/station-wanted")
+DASH_BIND = cfg("DASH_BIND", "127.0.0.1")
+HTTP_PORT = cfg_int("DASH_HTTP_PORT", 8088)
+TELEMETRY_PORT = cfg_int("DASH_TELEMETRY_PORT", 9001)
+CONTROL_PORT = cfg_int("DASH_CONTROL_PORT", 9002)
+DASH_USER = cfg("DASH_USER")
+DASH_PASSWORD = cfg("DASH_PASSWORD")
+SDS_SOURCE_ISSI = cfg_int("SDS_SOURCE_ISSI", 0)
+DL_FREQ = cfg("DL_FREQ_MHZ", "?")
+UL_FREQ = cfg("UL_FREQ_MHZ", "?")
+
+# Сессионный маркер: браузер получает его печеньем после Basic-аутентификации.
+# Нужен потому, что JS не может добавить заголовок Authorization к WebSocket,
+# а печенье к тому же origin браузер отправляет сам.
+SESSION_TOKEN = secrets.token_urlsafe(24)
+AUTH_REQUIRED = bool(DASH_PASSWORD)
+
+HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dash.html")
+
+
+def now():
+    return time.time()
+
+
+# ---------------------------------------------------------------------------
+# Состояние
+# ---------------------------------------------------------------------------
+
+class State:
+    """Всё наблюдаемое состояние. Один процесс, одна петля asyncio —
+    блокировки не нужны."""
+
+    def __init__(self):
+        self.started = now()
+        self.telemetry_link = False
+        self.control_link = False
+        self.backhaul = "неизвестно"
+        self.station = "неизвестно"      # из systemctl is-active
+        self.station_wanted = False      # флаговый файл
+        self.station_busy = ""           # "запускается" / "останавливается"
+        self.subscribers = {}
+        self.events = deque(maxlen=MAX_EVENTS)
+        self.calls = deque(maxlen=50)
+        self.browsers = set()
+        self.pending = {}
+        self.next_handle = 1
+        self.control_ws = None
+
+    def event(self, kind, text, source):
+        item = {"ts": now(), "kind": kind, "text": text, "source": source}
+        self.events.appendleft(item)
+        return item
+
+
+STATE = State()
+
+
+# ---------------------------------------------------------------------------
+# Уведомления наружу — тем же URL, что и у скриптов станции
+# ---------------------------------------------------------------------------
+
+async def notify(text):
+    if not NOTIFY_URL:
+        return
+    msg = f"{NOTIFY_PREFIX}{text}"
+    enc = "".join(f"%{b:02x}" for b in msg.encode("utf-8"))
+    url = NOTIFY_URL.replace("{message}", enc)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-m", "10", "-o", "/dev/null", url,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+    except Exception:
+        pass  # уведомление — диагностика, оно не имеет права ничего ломать
+
+
+# ---------------------------------------------------------------------------
+# Рассылка в браузеры
+# ---------------------------------------------------------------------------
+
+def snapshot():
+    return {
+        "type": "snapshot",
+        "telemetry_link": STATE.telemetry_link,
+        "control_link": STATE.control_link,
+        "backhaul": STATE.backhaul,
+        "station": STATE.station,
+        "station_wanted": STATE.station_wanted,
+        "station_busy": STATE.station_busy,
+        "dl_freq": DL_FREQ,
+        "ul_freq": UL_FREQ,
+        "sds_source": SDS_SOURCE_ISSI,
+        "uptime": now() - STATE.started,
+        "subscribers": [
+            {"issi": issi, **info} for issi, info in sorted(STATE.subscribers.items())
+        ],
+        "calls": list(STATE.calls),
+        "events": list(STATE.events)[:120],
+    }
+
+
+async def broadcast():
+    if not STATE.browsers:
+        return
+    payload = json.dumps(snapshot(), ensure_ascii=False)
+    dead = []
+    for ws in STATE.browsers:
+        try:
+            await ws.send(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        STATE.browsers.discard(ws)
+
+
+# ---------------------------------------------------------------------------
+# Управление станцией
+# ---------------------------------------------------------------------------
+
+async def systemctl(verb):
+    """Пуск и останов разрешены правилом polkit ровно для этого юнита.
+    --no-block обязателен: старт занимает до трёх минут (ExecStartPre ждёт
+    Pluto, ExecStartPost ждёт Brew), и держать на нём запрос браузера нельзя."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", verb, "--no-block", STATION_UNIT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            return False, err.decode("utf-8", "replace").strip() or "неизвестная ошибка"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+async def station_control(action):
+    if STATE.station_busy:
+        return {"ok": False, "error": f"уже {STATE.station_busy}, подождите"}
+
+    if action == "start":
+        try:
+            # Флаг ставим ПЕРЕД запуском: ConditionPathExists проверяется
+            # при каждой попытке, включая автоматические перезапуски.
+            open(STATION_FLAG, "w").close()
+        except OSError as e:
+            return {"ok": False, "error": f"не записать флаг {STATION_FLAG}: {e}"}
+
+        STATE.station_busy = "запускается"
+        STATE.event("control", "оператор запустил станцию", "панель")
+        await broadcast()
+        ok, err = await systemctl("start")
+        if not ok:
+            STATE.station_busy = ""
+            STATE.event("error", f"запуск не удался: {err}", "панель")
+            return {"ok": False, "error": err}
+        await notify("оператор запустил станцию с панели")
+        return {"ok": True}
+
+    if action == "stop":
+        STATE.station_busy = "останавливается"
+        STATE.event("control", "оператор остановил станцию", "панель")
+        await broadcast()
+        ok, err = await systemctl("stop")
+        if not ok:
+            STATE.station_busy = ""
+            STATE.event("error", f"останов не удался: {err}", "панель")
+            return {"ok": False, "error": err}
+        # Флаг снимаем ПОСЛЕ останова: иначе Restart=always успел бы
+        # передумать между удалением файла и командой стоп.
+        try:
+            os.unlink(STATION_FLAG)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return {"ok": False, "error": f"станция остановлена, но флаг не снят: {e}"}
+        await notify("оператор остановил станцию с панели, автозапуск выключен")
+        return {"ok": True}
+
+    return {"ok": False, "error": f"неизвестное действие {action}"}
+
+
+async def backhaul_socket_up():
+    """Есть ли у станции установленное TLS-соединение с ядром сети.
+    Тот же признак, по которому докладывает об удачном старте bs-poststart.sh:
+    сокет — это факт, а строка в логе — только память о прошлом."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ss", "-tn", "state", "established",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[-1].endswith(":443"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def station_watcher():
+    """Опрашивает systemd. Права не нужны: is-active доступен всем."""
+    while True:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", STATION_UNIT,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            active = out.decode().strip() or "unknown"
+
+            wanted = os.path.exists(STATION_FLAG)
+            changed = (active != STATE.station or wanted != STATE.station_wanted)
+
+            # Снимаем «запускается», когда systemd договорил
+            if STATE.station_busy == "запускается" and active in ("active", "failed"):
+                STATE.station_busy = ""
+                changed = True
+            elif STATE.station_busy == "останавливается" and active in ("inactive", "failed"):
+                STATE.station_busy = ""
+                changed = True
+
+            # Состояние магистрали берём по факту установленного сокета, а не
+            # из журнала: журнал читается только с момента запуска панели,
+            # поэтому после её перезапуска давно поднятая связь выглядела бы
+            # как «ждём подключения» навсегда.
+            backhaul = "станция не работает" if active != "active" else (
+                "подключён" if await backhaul_socket_up() else "нет связи")
+            if backhaul != STATE.backhaul:
+                STATE.backhaul = backhaul
+                changed = True
+
+            STATE.station = active
+            STATE.station_wanted = wanted
+            if changed:
+                await broadcast()
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+
+
+# ---------------------------------------------------------------------------
+# Телеметрия
+# ---------------------------------------------------------------------------
+
+def apply_telemetry(event):
+    (name, body), = event.items()
+    issi = body.get("issi")
+    sub = STATE.subscribers.setdefault(
+        issi, {"groups": [], "since": now(), "last_seen": now()}
+    )
+    sub["last_seen"] = now()
+
+    if name == "MsRegistration":
+        sub["since"] = now()
+        STATE.event("reg", f"рация {issi} зарегистрировалась", "телеметрия")
+    elif name == "MsDeregistration":
+        STATE.subscribers.pop(issi, None)
+        STATE.event("dereg", f"рация {issi} отключилась", "телеметрия")
+    elif name == "MsGroupAttach":
+        gssis = body.get("gssis", [])
+        for g in gssis:
+            if g not in sub["groups"]:
+                sub["groups"].append(g)
+        STATE.event("attach", f"{issi} встала на группы {gssis}", "телеметрия")
+    elif name == "MsGroupDetach":
+        gssis = body.get("gssis", [])
+        sub["groups"] = [g for g in sub["groups"] if g not in gssis]
+        STATE.event("detach", f"{issi} снялась с групп {gssis}", "телеметрия")
+    else:
+        STATE.event("other", f"неизвестное событие {name}: {body}", "телеметрия")
+
+
+async def telemetry_handler(ws):
+    STATE.telemetry_link = True
+    STATE.event("link", "станция подключилась к телеметрии", "сервис")
+    await broadcast()
+    try:
+        async for message in ws:
+            if isinstance(message, str):
+                continue
+            try:
+                apply_telemetry(json.loads(message))
+            except Exception as e:
+                STATE.event("error", f"разбор телеметрии: {e}", "сервис")
+            await broadcast()
+    except Exception:
+        # Станцию перезапустили или связь оборвалась — это штатное событие,
+        # разбираем его в finally, а не простынёй трассировки в журнале.
+        pass
+    finally:
+        STATE.telemetry_link = False
+        STATE.subscribers.clear()
+        STATE.event("link", "телеметрия отключилась", "сервис")
+        await broadcast()
+
+
+# ---------------------------------------------------------------------------
+# Управление станцией по Brew-подобному каналу: SDS
+# ---------------------------------------------------------------------------
+
+async def control_handler(ws):
+    STATE.control_link = True
+    STATE.control_ws = ws
+    STATE.event("link", "станция подключилась к каналу управления", "сервис")
+    await broadcast()
+    try:
+        async for message in ws:
+            if isinstance(message, str):
+                continue
+            try:
+                (name, body), = json.loads(message).items()
+                fut = STATE.pending.pop(body.get("handle"), None)
+                if fut and not fut.done():
+                    fut.set_result(body)
+                STATE.event("control", f"ответ станции {name}: {body}", "управление")
+            except Exception as e:
+                STATE.event("error", f"разбор ответа управления: {e}", "сервис")
+            await broadcast()
+    except Exception:
+        pass  # см. telemetry_handler
+    finally:
+        STATE.control_link = False
+        STATE.control_ws = None
+        STATE.event("link", "канал управления отключился", "сервис")
+        await broadcast()
+
+
+def build_sds_text(text):
+    """SDS-TL текстовое сообщение: протокольный идентификатор 0x82,
+    затем схема кодирования. Латиница влезает в 8-битную (0x01),
+    кириллица требует UCS-2 (0x1A) и вдвое больше места."""
+    try:
+        return bytes([0x82, 0x01]) + text.encode("ascii")
+    except UnicodeEncodeError:
+        return bytes([0x82, 0x1A]) + text.encode("utf-16-be")
+
+
+async def send_sds(dest_ssi, text, dest_is_group=False):
+    if STATE.control_ws is None:
+        return {"ok": False, "error": "канал управления не подключён"}
+
+    payload = build_sds_text(text)
+    if len(payload) * 8 > 2047:
+        return {"ok": False, "error": f"слишком длинно: {len(payload)} байт, "
+                                      f"предел станции 2047 бит"}
+
+    handle = STATE.next_handle
+    STATE.next_handle += 1
+
+    cmd = {"SendSds": {
+        "handle": handle,
+        "source_ssi": SDS_SOURCE_ISSI,
+        "dest_ssi": dest_ssi,
+        "dest_is_group": dest_is_group,
+        "len_bits": len(payload) * 8,
+        "payload": list(payload),
+    }}
+
+    fut = asyncio.get_running_loop().create_future()
+    STATE.pending[handle] = fut
+    await STATE.control_ws.send(json.dumps(cmd).encode())
+    STATE.event("sds", f"SDS {SDS_SOURCE_ISSI} -> {dest_ssi}: {text!r}", "управление")
+
+    try:
+        body = await asyncio.wait_for(fut, timeout=10)
+    except asyncio.TimeoutError:
+        STATE.pending.pop(handle, None)
+        return {"ok": False, "error": "станция не ответила за 10 с"}
+
+    if not body.get("success"):
+        return {"ok": False,
+                "error": "станция отказала — почти всегда значит, что получатель "
+                         "не зарегистрирован в соте"}
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Журнал systemd как источник того, чего нет в телеметрии
+# ---------------------------------------------------------------------------
+
+RE_BACKHAUL = re.compile(r"backhaul (CONNECTED|DISCONNECTED)")
+RE_GROUP_TX = re.compile(r"GROUP_TX uuid=(\S+?)\s+src=(\d+) dst=(\d+)")
+RE_LOCAL_CALL = re.compile(
+    r"forwarding local call to TetraPack: call_id=(\d+) src=(\d+) gssi=(\d+)")
+RE_SUB_UPDATE = re.compile(
+    r"MmSubscriberUpdate \{ issi: (\d+), groups: \[([^\]]*)\], action: (\w+)")
+
+
+def parse_journal_line(line):
+    line = ANSI.sub("", line).rstrip()
+
+    m = RE_BACKHAUL.search(line)
+    if m:
+        STATE.backhaul = "подключён" if m.group(1) == "CONNECTED" else "разорван"
+        return STATE.event("backhaul", f"Brew: {STATE.backhaul}", "журнал")
+
+    m = RE_GROUP_TX.search(line)
+    if m:
+        call = {"ts": now(), "dir": "из сети",
+                "src": int(m.group(2)), "dst": int(m.group(3))}
+        STATE.calls.appendleft(call)
+        return STATE.event(
+            "call", f"вызов из сети: {call['src']} -> группа {call['dst']}", "журнал")
+
+    m = RE_LOCAL_CALL.search(line)
+    if m:
+        call = {"ts": now(), "dir": "в сеть",
+                "src": int(m.group(2)), "dst": int(m.group(3))}
+        STATE.calls.appendleft(call)
+        return STATE.event(
+            "call", f"вызов в сеть: {call['src']} -> группа {call['dst']}", "журнал")
+
+    m = RE_SUB_UPDATE.search(line)
+    if m:
+        return STATE.event(
+            "mm", f"MM: {m.group(3)} issi={m.group(1)} группы=[{m.group(2)}]", "журнал")
+
+    return None
+
+
+async def journal_reader():
+    unit = STATION_UNIT.removesuffix(".service")
+    while True:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "journalctl", "-u", unit, "-f", "-n", "0", "-o", "cat",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            async for raw in proc.stdout:
+                if parse_journal_line(raw.decode("utf-8", "replace")):
+                    await broadcast()
+        except Exception as e:
+            STATE.event("error", f"чтение журнала: {e}", "сервис")
+        await asyncio.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Браузер: аутентификация и обработка
+# ---------------------------------------------------------------------------
+
+def check_basic(headers):
+    header = headers.get("Authorization", "")
+    if not header.startswith("Basic "):
+        return False
+    try:
+        user, _, password = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+    except Exception:
+        return False
+    # Сравнение постоянного времени: пароль короткий, утечка по таймингу реальна
+    return (hmac.compare_digest(user, DASH_USER)
+            and hmac.compare_digest(password, DASH_PASSWORD))
+
+
+def check_cookie(headers):
+    for raw in headers.get_all("Cookie"):
+        for part in raw.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "dash" and hmac.compare_digest(value, SESSION_TOKEN):
+                return True
+    return False
+
+
+def authorized(headers):
+    if not AUTH_REQUIRED:
+        return True
+    return check_basic(headers) or check_cookie(headers)
+
+
+def unauthorized():
+    body = "Требуется вход\n".encode("utf-8")
+    headers = Headers()
+    headers["WWW-Authenticate"] = 'Basic realm="tetra-dash"'
+    headers["Content-Type"] = "text/plain; charset=utf-8"
+    headers["Content-Length"] = str(len(body))
+    return Response(401, "Unauthorized", headers, body)
+
+
+async def browser_handler(ws):
+    STATE.browsers.add(ws)
+    try:
+        await ws.send(json.dumps(snapshot(), ensure_ascii=False))
+        async for message in ws:
+            try:
+                req = json.loads(message)
+            except Exception:
+                continue
+
+            cmd = req.get("cmd")
+            if cmd == "send_sds":
+                result = await send_sds(int(req["dest"]), req["text"],
+                                        bool(req.get("is_group", False)))
+                await ws.send(json.dumps({"type": "sds_result", **result},
+                                         ensure_ascii=False))
+            elif cmd == "station":
+                result = await station_control(req.get("action"))
+                await ws.send(json.dumps({"type": "station_result", **result},
+                                         ensure_ascii=False))
+            await broadcast()
+    finally:
+        STATE.browsers.discard(ws)
+
+
+def http_page(connection, request):
+    """Аутентификация проверяется здесь для всех запросов, включая рукопожатие
+    WebSocket, — так проверка ровно одна и обойти её нечем."""
+    if not authorized(request.headers):
+        return unauthorized()
+
+    if request.path == "/ws":
+        return None  # пропускаем в обработчик WebSocket
+
+    try:
+        with open(HTML_PATH, encoding="utf-8") as f:
+            body = f.read().encode("utf-8")
+    except OSError as e:
+        body = f"dash.html не читается: {e}".encode("utf-8")
+        headers = Headers()
+        headers["Content-Type"] = "text/plain; charset=utf-8"
+        headers["Content-Length"] = str(len(body))
+        return Response(500, "Internal Server Error", headers, body)
+
+    headers = Headers()
+    headers["Content-Type"] = "text/html; charset=utf-8"
+    headers["Content-Length"] = str(len(body))
+    if AUTH_REQUIRED:
+        # JS не умеет добавлять заголовки к WebSocket, а печенье к своему же
+        # origin браузер отправляет сам — этим и авторизуем /ws
+        headers["Set-Cookie"] = (
+            f"dash={SESSION_TOKEN}; Path=/; SameSite=Strict; HttpOnly")
+    return Response(200, "OK", headers, body)
+
+
+# ---------------------------------------------------------------------------
+
+async def main():
+    if AUTH_REQUIRED:
+        auth_note = f"вход {DASH_USER}"
+    elif DASH_BIND in ("127.0.0.1", "localhost", "::1"):
+        auth_note = "без пароля, только петля"
+    else:
+        auth_note = "ВНИМАНИЕ: без пароля и слушает сеть"
+
+    async with (
+        serve(telemetry_handler, "127.0.0.1", TELEMETRY_PORT,
+              subprotocols=[TELEMETRY_PROTOCOL]),
+        serve(control_handler, "127.0.0.1", CONTROL_PORT,
+              subprotocols=[CONTROL_PROTOCOL]),
+        serve(browser_handler, DASH_BIND, HTTP_PORT, process_request=http_page),
+    ):
+        print(f"tetra-dash: телеметрия :{TELEMETRY_PORT}, управление :{CONTROL_PORT}, "
+              f"панель {DASH_BIND}:{HTTP_PORT} ({auth_note})", flush=True)
+        STATE.event("link", "сервис запущен", "сервис")
+        await asyncio.gather(journal_reader(), station_watcher())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

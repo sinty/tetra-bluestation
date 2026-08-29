@@ -1,0 +1,48 @@
+[Unit]
+Description=TETRA BlueStation, базовая станция
+Documentation=https://github.com/MidnightBlueLabs/tetra-bluestation
+After=network-online.target
+Wants=network-online.target
+# Без ограничения частоты перезапусков: если Pluto ещё не загрузился,
+# ExecStartPre падает, и юнит должен пробовать снова сколько угодно долго.
+StartLimitIntervalSec=0
+
+# Выключатель станции. Нет файла — юнит не поднимается ни при загрузке,
+# ни по Restart. Так решение оператора переживает перезагрузку, а панели
+# не нужно право enable/disable: она просто создаёт и удаляет этот файл.
+# Путь должен совпадать с STATION_FLAG в /etc/tetra-lab.conf.
+ConditionPathExists=/var/lib/tetra-lab/station-wanted
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/home/claude/src/tetra-bluestation
+
+# ExecStartPre ждёт Pluto до 120 с, ExecStartPost ждёт Brew до 60 с.
+# Штатных 90 с на всё про всё не хватает — иначе systemd убьёт старт на середине.
+TimeoutStartSec=300
+
+# Подготовка Pluto: буферы, проверка прошивки, снятие петли
+ExecStartPre=/usr/local/sbin/pluto-prepare.sh
+ExecStart=/home/claude/src/tetra-bluestation/target/release/bluestation-bs hamcell.toml
+# Доклад об удачном старте — только после того, как поднялся Brew
+ExecStartPost=/usr/local/sbin/bs-poststart.sh
+# Доклад о падении или штатной остановке
+ExecStopPost=/usr/local/sbin/bs-poststop.sh
+
+# PHY паникует на RxReadError, когда Pluto теряет сэмплы.
+# Перезапуск заодно заново готовит Pluto — это же лечит и его перезагрузку.
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+
+# Права на планирование реального времени: pam_limits к юнитам systemd
+# не применяется, поэтому дублируем /etc/security/limits.d/90-rt-sdr.conf здесь
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=73
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

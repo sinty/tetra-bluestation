@@ -1,0 +1,28 @@
+[Unit]
+Description=tetra-dash — панель наблюдения и управления базовой станцией
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/home/claude/tetra-dash
+ExecStart=/home/claude/tetra-dash-venv/bin/python /home/claude/tetra-dash/tetra_dash.py
+Restart=always
+RestartSec=5
+
+# Панель наблюдает, шлёт SDS и дёргает один юнит systemd. Права на это даёт
+# правило polkit, а не sudo — поэтому NoNewPrivileges можно оставить.
+# Снимать его нельзя: у пользователя claude общий NOPASSWD-доступ,
+# и без этого флага панель получила бы root целиком.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Каталог с флагом «станция нужна» — единственное, что панель пишет вне себя
+ReadWritePaths=/home/claude/tetra-dash /var/lib/tetra-lab
+
+[Install]
+WantedBy=multi-user.target
