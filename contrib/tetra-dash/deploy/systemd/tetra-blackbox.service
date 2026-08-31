@@ -1,0 +1,17 @@
+[Unit]
+Description=Чёрный ящик: снимок состояния машины для разбора зависаний
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tetra-blackbox.sh
+Restart=always
+RestartSec=5
+
+# Приоритет НИЖЕ обычного и класс idle по вводу-выводу: писец не должен
+# отбирать ресурсы у станции и сам становиться причиной того, что изучает.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

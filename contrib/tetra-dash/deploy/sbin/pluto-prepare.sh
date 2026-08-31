@@ -61,20 +61,25 @@ case "$FW" in
                     exit 1 ;;
 esac
 
-# 3. Буферы UDP на стороне Pluto + перезапуск гаджета, чтобы подхватил SO_RCVBUF
-CUR=$($PSH 'cat /proc/sys/net/core/rmem_max' 2>/dev/null)
-if [ "${CUR:-0}" -lt "$WANT_BUF" ]; then
-    log "буферы Pluto: $CUR -> $WANT_BUF, перезапускаю sdr_ip_gadget"
-    $PSH "echo $WANT_BUF > /proc/sys/net/core/rmem_max;
-          echo $WANT_BUF > /proc/sys/net/core/rmem_default;
-          echo $WANT_BUF > /proc/sys/net/core/wmem_max;
-          echo $WANT_BUF > /proc/sys/net/core/wmem_default;
-          echo 5000      > /proc/sys/net/core/netdev_max_backlog;
-          /etc/init.d/S55sdr_ip_gadget restart" >/dev/null 2>&1
-    sleep 3
-else
-    log "буферы Pluto уже подняты ($CUR)"
-fi
+# 3. Буферы UDP на стороне Pluto + БЕЗУСЛОВНЫЙ перезапуск гаджета.
+#
+# Перезапуск делается всегда, а не только когда буферы малы. Причина найдена
+# 2026-08-31: если гость умер, не попрощавшись (зависание, ресет), гаджет
+# на Pluto остаётся с недозакрытой сессией и сбитой базой меток времени.
+# Следующий запуск станции наследует её и сыплет "Too late to produce TX block"
+# десятками тысяч — в эфире при этом рваные обрывки. Проверено: до перезапуска
+# гаджета 31073 пропуска за три минуты, после — ноль.
+#
+# Раскрутка RT-потоков на этих пропусках, судя по всему, и доводила гостя
+# до следующего зависания, замыкая круг.
+log "поднимаю буферы Pluto и перезапускаю sdr_ip_gadget"
+$PSH "echo $WANT_BUF > /proc/sys/net/core/rmem_max;
+      echo $WANT_BUF > /proc/sys/net/core/rmem_default;
+      echo $WANT_BUF > /proc/sys/net/core/wmem_max;
+      echo $WANT_BUF > /proc/sys/net/core/wmem_default;
+      echo 5000      > /proc/sys/net/core/netdev_max_backlog;
+      /etc/init.d/S55sdr_ip_gadget restart" >/dev/null 2>&1
+sleep 5
 
 # 4. Ловушки из раздела 4 журнала: цифровая петля и калибровка опоры
 LB=$(iio_attr -u "ip:$PLUTO" -D ad9361-phy loopback 2>/dev/null | tail -1)
