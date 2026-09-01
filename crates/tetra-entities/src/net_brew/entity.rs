@@ -115,6 +115,12 @@ pub struct BrewEntity {
     /// Whether the worker is connected
     connected: bool,
 
+    /// ПРАВКА R2BMP: когда привязки абонентов последний раз объявлялись в сеть.
+    /// TetraPack забывает их примерно через восемь часов, а станция объявляла
+    /// только при подключении — после чего сота молча переставала получать
+    /// трафик группы при живой и исправной магистрали.
+    last_resync: Option<std::time::Instant>,
+
     /// Worker thread handle for graceful shutdown
     worker_handle: Option<thread::JoinHandle<()>>,
 }
@@ -157,6 +163,7 @@ impl BrewEntity {
             ul_forwarded: HashMap::new(),
             subscriber_groups: HashMap::new(),
             connected: false,
+            last_resync: None,
             worker_handle: Some(handle),
         }
     }
@@ -291,6 +298,30 @@ impl BrewEntity {
                     );
                 }
             }
+        }
+    }
+
+    /// ПРАВКА R2BMP: периодически объявлять привязки заново.
+    ///
+    /// Наблюдение 2026-09-01: привязка, объявленная в 06:07:35, перестала
+    /// действовать в 14:07:35 — ровно через восемь часов, секунда в секунду.
+    /// Сокет при этом оставался живым и обменивался данными, поэтому ни
+    /// переподключения, ни ошибки не происходило: сота просто переставала
+    /// получать трафик группы. Час выбран с большим запасом.
+    fn refresh_subscribers_if_due(&mut self) {
+        if !self.connected {
+            return;
+        }
+        const RESYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+        let now = std::time::Instant::now();
+        let due = match self.last_resync {
+            None => true,
+            Some(prev) => now.duration_since(prev) >= RESYNC_EVERY,
+        };
+        if due {
+            self.last_resync = Some(now);
+            tracing::info!("BrewEntity: подтверждаю привязки абонентов");
+            self.resync_subscribers();
         }
     }
 
@@ -700,6 +731,8 @@ impl TetraEntityTrait for BrewEntity {
         self.dltime = ts;
         // Process all pending events from the worker thread
         self.process_events(queue);
+        // ПРАВКА R2BMP: подтверждать привязки, пока сеть о них не забыла
+        self.refresh_subscribers_if_due();
         // Feed one buffered frame at each traffic playout opportunity.
         self.drain_jitter_playout(queue);
         // Expire hanging calls that have exceeded hangtime
