@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Проверочный клиент панели: ходит так же, как браузер, с HTTP Basic.
-Без аргумента — печатает состояние. С аргументом start|stop — шлёт команду."""
+
+    dashcli.py                  состояние
+    dashcli.py start|stop       команда станции
+    dashcli.py reset-callsigns  сбросить кэш позывных
+"""
 import asyncio
 import base64
 import json
@@ -22,6 +26,8 @@ cred = conf["DASH_USER"] + ":" + conf["DASH_PASSWORD"]
 auth = "Basic " + base64.b64encode(cred.encode()).decode()
 url = "ws://127.0.0.1:" + conf.get("DASH_HTTP_PORT", "8088") + "/ws"
 
+arg = sys.argv[1] if len(sys.argv) > 1 else ""
+
 
 async def main():
     async with connect(url, additional_headers={"Authorization": auth}) as ws:
@@ -30,13 +36,29 @@ async def main():
             s["station"], s["station_wanted"], s["station_busy"],
             s["backhaul"], s["telemetry_link"], s["control_link"]))
 
-        if len(sys.argv) > 1:
-            await ws.send(json.dumps({"cmd": "station", "action": sys.argv[1]}))
-            for _ in range(10):
-                m = json.loads(await ws.recv())
-                if m.get("type") == "station_result":
-                    print("ответ:", m)
-                    break
+        subs = s.get("subscribers") or []
+        if subs:
+            for r in subs:
+                print("  рация {} {} группы {}".format(
+                    r["issi"], r.get("call") or "(позывной не найден)", r["groups"]))
+        else:
+            print("  раций в соте нет")
+        print("  позывных в кэше:", s.get("callsign_cache", 0))
+
+        if arg in ("start", "stop"):
+            await ws.send(json.dumps({"cmd": "station", "action": arg}))
+            want = "station_result"
+        elif arg == "reset-callsigns":
+            await ws.send(json.dumps({"cmd": "reset_callsigns"}))
+            want = "callsign_result"
+        else:
+            return
+
+        for _ in range(10):
+            m = json.loads(await ws.recv())
+            if m.get("type") == want:
+                print("ответ:", m)
+                break
 
 
 asyncio.run(main())

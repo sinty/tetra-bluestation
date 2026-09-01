@@ -74,6 +74,7 @@
   button.danger { background: var(--bad); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   .note { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .dim { color: var(--dim); }
   .result { margin-top: 8px; font-size: 13px; min-height: 1.4em; }
   .result.ok { color: var(--ok); }
   .result.bad { color: var(--bad); }
@@ -116,7 +117,7 @@
   <div class="panel">
     <h2>Рации в соте</h2>
     <table>
-      <thead><tr><th>ISSI</th><th>Группы</th><th>В сети</th></tr></thead>
+      <thead><tr><th>ISSI</th><th>Позывной</th><th>Группы</th><th>В сети</th></tr></thead>
       <tbody id="subs"></tbody>
     </table>
     <div class="empty" id="subs-empty">ни одна рация не зарегистрирована</div>
@@ -146,6 +147,21 @@
     </div>
   </div>
 
+</div>
+
+<div class="panel" style="margin-top:16px">
+  <h2>Настройки</h2>
+  <form id="cfg">
+    <button type="button" id="b-reset-calls">Сбросить кэш позывных</button>
+    <span class="dim" id="cache-info">—</span>
+  </form>
+  <div class="result" id="cfg-result"></div>
+  <div class="note">
+    Позывные берутся из внешнего справочника и хранятся на диске: найденные —
+    постоянно, ненайденные перепроверяются через неделю. Сброс заставит
+    опросить справочник заново — пригодится, если позывной сменился
+    или ID зарегистрировали недавно.
+  </div>
 </div>
 
 <div class="panel" style="margin-top:16px">
@@ -191,6 +207,7 @@ function render(s) {
   $("dl2").textContent = s.dl_freq;
   $("ul").textContent = s.ul_freq;
   $("src").textContent = s.sds_source;
+  $("cache-info").textContent = "в кэше записей: " + (s.callsign_cache ?? 0);
 
   const st = stationWords(s);
   $("t-st").textContent = st.text;
@@ -210,6 +227,7 @@ function render(s) {
   for (const r of s.subscribers) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td>${r.issi}</td>
+                    <td>${r.call ? esc(r.call) : "<span class=dim>—</span>"}</td>
                     <td>${r.groups.length ? r.groups.join(", ") : "—"}</td>
                     <td>${since(r.since)}</td>`;
     subs.appendChild(tr);
@@ -221,7 +239,7 @@ function render(s) {
   dest.innerHTML = '<option value="">— получатель —</option>';
   for (const r of s.subscribers) {
     const o = document.createElement("option");
-    o.value = r.issi; o.textContent = r.issi;
+    o.value = r.issi; o.textContent = r.call ? `${r.issi} — ${r.call}` : r.issi;
     dest.appendChild(o);
   }
   dest.value = prev;
@@ -231,8 +249,10 @@ function render(s) {
   calls.innerHTML = "";
   for (const c of s.calls.slice(0, 12)) {
     const tr = document.createElement("tr");
+    const who = state.callsigns && state.callsigns[c.src]
+      ? `${c.src} <span class=dim>${esc(state.callsigns[c.src])}</span>` : c.src;
     tr.innerHTML = `<td>${hhmmss(c.ts)}</td><td>${c.dir}</td>
-                    <td>${c.src}</td><td>${c.dst}</td>`;
+                    <td>${who}</td><td>${c.dst}</td>`;
     calls.appendChild(tr);
   }
   $("calls-empty").style.display = s.calls.length ? "none" : "block";
@@ -261,6 +281,11 @@ function connect() {
       const r = $("sds-result");
       r.className = "result " + (msg.ok ? "ok" : "bad");
       r.textContent = msg.ok ? "Отправлено." : "Не отправлено: " + msg.error;
+    } else if (msg.type === "callsign_result") {
+      const r = $("cfg-result");
+      r.className = "result " + (msg.ok ? "ok" : "bad");
+      r.textContent = msg.ok ? "Кэш сброшен, опрашиваю справочник заново."
+                             : "Не вышло: " + msg.error;
     } else if (msg.type === "station_result") {
       const r = $("ctl-result");
       r.className = "result " + (msg.ok ? "ok" : "bad");
@@ -268,6 +293,12 @@ function connect() {
     }
   };
 }
+
+$("b-reset-calls").onclick = () => {
+  $("cfg-result").className = "result";
+  $("cfg-result").textContent = "Сбрасываю…";
+  ws.send(JSON.stringify({ cmd: "reset_callsigns" }));
+};
 
 $("b-start").onclick = () => {
   $("ctl-result").className = "result";

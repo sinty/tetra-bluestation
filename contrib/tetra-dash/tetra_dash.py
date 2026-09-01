@@ -98,6 +98,8 @@ CONTROL_PORT = cfg_int("DASH_CONTROL_PORT", 9002)
 DASH_USER = cfg("DASH_USER")
 DASH_PASSWORD = cfg("DASH_PASSWORD")
 SDS_SOURCE_ISSI = cfg_int("SDS_SOURCE_ISSI", 0)
+CALLSIGN_URL = cfg("CALLSIGN_URL")
+CALLSIGN_CACHE = cfg("CALLSIGN_CACHE", "/var/lib/tetra-lab/callsigns.json")
 DL_FREQ = cfg("DL_FREQ_MHZ", "?")
 UL_FREQ = cfg("UL_FREQ_MHZ", "?")
 
@@ -186,8 +188,11 @@ def snapshot():
         "sds_source": SDS_SOURCE_ISSI,
         "uptime": now() - STATE.started,
         "subscribers": [
-            {"issi": issi, **info} for issi, info in sorted(STATE.subscribers.items())
+            {"issi": issi, "call": callsign_of(issi), **info}
+            for issi, info in sorted(STATE.subscribers.items())
         ],
+        "callsigns": {str(i): r.get("call") for i, r in CALLSIGNS.items() if r.get("call")},
+        "callsign_cache": len(CALLSIGNS),
         "calls": list(STATE.calls),
         "events": list(STATE.events)[:120],
     }
@@ -477,6 +482,126 @@ async def send_sds(dest_ssi, text, dest_is_group=False):
 
 
 # ---------------------------------------------------------------------------
+# Позывные: разрешение ID через внешний справочник, с дисковым кэшем
+# ---------------------------------------------------------------------------
+
+# Кэш нужен не ради скорости, а ради приличия: справочник — чужой публичный
+# сервис, и дёргать его на каждую перерисовку панели нельзя. Положительные
+# записи живут вечно (позывной за ID закреплён), отрицательные перепроверяются
+# через неделю — ID мог быть зарегистрирован уже после нашего запроса.
+NEGATIVE_TTL = 7 * 24 * 3600
+
+CALLSIGNS = {}          # issi -> {"call": str|None, "name": str, "city": str, "ts": float}
+_resolving = set()      # чтобы не запрашивать один ID несколькими задачами сразу
+
+
+def load_callsigns():
+    try:
+        with open(CALLSIGN_CACHE, encoding="utf-8") as f:
+            data = json.load(f)
+        return {int(k): v for k, v in data.items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_callsigns():
+    """Пишем через временный файл: обрыв посреди записи не должен оставить
+    покалеченный кэш, который потом не прочитается."""
+    tmp = CALLSIGN_CACHE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in CALLSIGNS.items()}, f, ensure_ascii=False)
+        os.replace(tmp, CALLSIGN_CACHE)
+    except OSError as e:
+        STATE.event("error", f"кэш позывных не сохранён: {e}", "сервис")
+
+
+def callsign_of(issi):
+    rec = CALLSIGNS.get(issi)
+    return rec.get("call") if rec else None
+
+
+def needs_lookup(issi):
+    rec = CALLSIGNS.get(issi)
+    if rec is None:
+        return True
+    if rec.get("call"):
+        return False
+    return now() - rec.get("ts", 0) > NEGATIVE_TTL
+
+
+async def resolve_callsign(issi):
+    if not CALLSIGN_URL or issi in _resolving or not needs_lookup(issi):
+        return False
+    _resolving.add(issi)
+    try:
+        url = CALLSIGN_URL.replace("{id}", str(issi))
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-m", "12", url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        rec = {"call": None, "name": "", "city": "", "ts": now()}
+        try:
+            results = json.loads(out.decode("utf-8", "replace")).get("results") or []
+            if results:
+                r = results[0]
+                rec = {"call": r.get("callsign") or None,
+                       "name": (r.get("fname") or "").strip(),
+                       "city": (r.get("city") or "").strip(),
+                       "ts": now()}
+        except ValueError:
+            pass  # справочник ответил не JSON — считаем, что не нашли
+        CALLSIGNS[issi] = rec
+        save_callsigns()
+        if rec["call"]:
+            STATE.event("callsign", f"{issi} = {rec['call']}"
+                        + (f", {rec['name']}" if rec["name"] else ""), "справочник")
+        return True
+    except Exception as e:
+        STATE.event("error", f"справочник позывных: {e}", "сервис")
+        return False
+    finally:
+        _resolving.discard(issi)
+
+
+def known_issis():
+    """Все ID, которые где-то показываются: абоненты и участники вызовов."""
+    ids = set(STATE.subscribers)
+    for c in STATE.calls:
+        ids.add(c.get("src"))
+    ids.add(SDS_SOURCE_ISSI)
+    return {i for i in ids if isinstance(i, int) and i > 0}
+
+
+async def callsign_resolver():
+    """Фоновое разрешение. По одному запросу за раз и с паузой — чужой сервис
+    не должен получать от нас очередь."""
+    while True:
+        changed = False
+        for issi in sorted(known_issis()):
+            if needs_lookup(issi):
+                if await resolve_callsign(issi):
+                    changed = True
+                await asyncio.sleep(1)
+        if changed:
+            await broadcast()
+        await asyncio.sleep(10)
+
+
+async def reset_callsigns():
+    CALLSIGNS.clear()
+    try:
+        os.unlink(CALLSIGN_CACHE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    STATE.event("callsign", "кэш позывных сброшен, справочник опрошу заново", "панель")
+    await broadcast()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Журнал systemd как источник того, чего нет в телеметрии
 # ---------------------------------------------------------------------------
 
@@ -672,6 +797,10 @@ async def browser_handler(ws):
                                         bool(req.get("is_group", False)))
                 await ws.send(json.dumps({"type": "sds_result", **result},
                                          ensure_ascii=False))
+            elif cmd == "reset_callsigns":
+                result = await reset_callsigns()
+                await ws.send(json.dumps({"type": "callsign_result", **result},
+                                         ensure_ascii=False))
             elif cmd == "station":
                 result = await station_control(req.get("action"))
                 await ws.send(json.dumps({"type": "station_result", **result},
@@ -730,9 +859,12 @@ async def main():
     ):
         print(f"tetra-dash: телеметрия :{TELEMETRY_PORT}, управление :{CONTROL_PORT}, "
               f"панель {DASH_BIND}:{HTTP_PORT} ({auth_note})", flush=True)
+        CALLSIGNS.update(load_callsigns())
+        if CALLSIGNS:
+            STATE.event("callsign", f"кэш позывных: {len(CALLSIGNS)} записей", "сервис")
         STATE.event("link", "сервис запущен", "сервис")
         await resync_subscribers()
-        await asyncio.gather(journal_reader(), station_watcher())
+        await asyncio.gather(journal_reader(), station_watcher(), callsign_resolver())
 
 
 if __name__ == "__main__":
