@@ -372,6 +372,8 @@ def apply_telemetry(event):
 async def telemetry_handler(ws):
     STATE.telemetry_link = True
     STATE.event("link", "станция подключилась к телеметрии", "сервис")
+    # Станция не повторяет события о тех, кто зарегистрировался раньше нас
+    await resync_subscribers()
     await broadcast()
     try:
         async for message in ws:
@@ -388,7 +390,8 @@ async def telemetry_handler(ws):
         pass
     finally:
         STATE.telemetry_link = False
-        STATE.subscribers.clear()
+        # Список НЕ чистим: рации остаются в соте и при оборванной телеметрии.
+        # Достоверность восстановит пересказ журнала при следующем подключении.
         STATE.event("link", "телеметрия отключилась", "сервис")
         await broadcast()
 
@@ -515,6 +518,84 @@ def parse_journal_line(line):
             "mm", f"MM: {m.group(3)} issi={m.group(1)} группы=[{m.group(2)}]", "журнал")
 
     return None
+
+
+RE_AFFIL = re.compile(r"issi=(\d+)\s*→\s*(DE)?AFFILIATE groups=\[([0-9,\s]*)\]")
+RE_MM_UPD = re.compile(
+    r"MmSubscriberUpdate \{ issi: (\d+), groups: \[([0-9,\s]*)\], action: (\w+)")
+
+
+def _groups(text):
+    return [int(x) for x in text.replace(" ", "").split(",") if x]
+
+
+async def station_started_at():
+    """Момент запуска станции. Всё, что в журнале раньше, относится
+    к прошлой её жизни и к текущему составу абонентов отношения не имеет."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "show", STATION_UNIT, "-p", "ActiveEnterTimestamp", "--value",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        return out.decode().strip()
+    except Exception:
+        return ""
+
+
+async def resync_subscribers():
+    """Перечитывает состав раций из журнала станции.
+
+    Нужно потому, что телеметрия событийная: станция сообщает о регистрации
+    один раз и больше не повторяет. Если панель перезапустилась позже рации,
+    она о ней никогда не узнает — и показывает пустую соту при работающей связи.
+    Проверять состав можно только пересказом журнала с момента старта станции.
+    """
+    since = await station_started_at()
+    if not since:
+        return
+    unit = STATION_UNIT.removesuffix(".service")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat",
+            "--grep", "AFFILIATE|MmSubscriberUpdate",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+    except Exception as e:
+        STATE.event("error", f"пересказ журнала не удался: {e}", "сервис")
+        return
+
+    subs = {}
+    for raw in out.decode("utf-8", "replace").splitlines():
+        line = ANSI.sub("", raw)
+
+        m = RE_MM_UPD.search(line)
+        if m:
+            issi, groups, action = int(m.group(1)), _groups(m.group(2)), m.group(3)
+            if action.lower().startswith("dereg"):
+                subs.pop(issi, None)
+            else:
+                sub = subs.setdefault(issi, {"groups": [], "since": now(), "last_seen": now()})
+                for g in groups:
+                    if g not in sub["groups"]:
+                        sub["groups"].append(g)
+            continue
+
+        m = RE_AFFIL.search(line)
+        if m:
+            issi, off, groups = int(m.group(1)), bool(m.group(2)), _groups(m.group(3))
+            sub = subs.setdefault(issi, {"groups": [], "since": now(), "last_seen": now()})
+            if off:
+                sub["groups"] = [g for g in sub["groups"] if g not in groups]
+            else:
+                for g in groups:
+                    if g not in sub["groups"]:
+                        sub["groups"].append(g)
+
+    if subs != STATE.subscribers:
+        STATE.subscribers = subs
+        names = ", ".join(str(i) for i in sorted(subs)) or "никого"
+        STATE.event("resync", f"состав раций восстановлен из журнала: {names}", "сервис")
+        await broadcast()
 
 
 async def journal_reader():
@@ -650,6 +731,7 @@ async def main():
         print(f"tetra-dash: телеметрия :{TELEMETRY_PORT}, управление :{CONTROL_PORT}, "
               f"панель {DASH_BIND}:{HTTP_PORT} ({auth_note})", flush=True)
         STATE.event("link", "сервис запущен", "сервис")
+        await resync_subscribers()
         await asyncio.gather(journal_reader(), station_watcher())
 
 
