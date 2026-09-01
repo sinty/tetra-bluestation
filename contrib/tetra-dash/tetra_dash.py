@@ -98,6 +98,10 @@ CONTROL_PORT = cfg_int("DASH_CONTROL_PORT", 9002)
 DASH_USER = cfg("DASH_USER")
 DASH_PASSWORD = cfg("DASH_PASSWORD")
 SDS_SOURCE_ISSI = cfg_int("SDS_SOURCE_ISSI", 0)
+PLUTO_HOST = cfg("PLUTO_HOST")
+TEMP_INTERVAL = cfg_int("PLUTO_TEMP_INTERVAL", 30)
+TEMP_HISTORY = cfg("PLUTO_TEMP_HISTORY", "/var/lib/tetra-lab/pluto-temp.json")
+TEMP_POINTS = cfg_int("PLUTO_TEMP_POINTS", 720)
 CALLSIGN_URL = cfg("CALLSIGN_URL")
 CALLSIGN_CACHE = cfg("CALLSIGN_CACHE", "/var/lib/tetra-lab/callsigns.json")
 DL_FREQ = cfg("DL_FREQ_MHZ", "?")
@@ -193,6 +197,8 @@ def snapshot():
         ],
         "callsigns": {str(i): r.get("call") for i, r in CALLSIGNS.items() if r.get("call")},
         "callsign_cache": len(CALLSIGNS),
+        "temps": list(TEMPS),
+        "temp_now": TEMPS[-1] if TEMPS else None,
         "calls": list(STATE.calls),
         "events": list(STATE.events)[:120],
     }
@@ -479,6 +485,83 @@ async def send_sds(dest_ssi, text, dest_is_group=False):
                 "error": "станция отказала — почти всегда значит, что получатель "
                          "не зарегистрирован в соте"}
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Температура Pluto
+# ---------------------------------------------------------------------------
+
+# Два независимых датчика, и мерят они разное:
+#   AD9363 — сам радиотракт, греется от передачи;
+#   XADC   — кристалл Zynq, греется от обработки и от корпуса в целом.
+# Расходятся они обычно градусов на двадцать, и следить полезно за обоими:
+# рост радиотракта при спокойном SoC означает проблему в передаче, а общий
+# подъём — что коробке нечем дышать.
+
+TEMPS = deque(maxlen=TEMP_POINTS)   # [{"ts":…, "rf":…, "soc":…}]
+
+
+def load_temps():
+    try:
+        with open(TEMP_HISTORY, encoding="utf-8") as f:
+            for item in json.load(f)[-TEMP_POINTS:]:
+                TEMPS.append(item)
+    except (OSError, ValueError):
+        pass
+
+
+def save_temps():
+    tmp = TEMP_HISTORY + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(TEMPS), f)
+        os.replace(tmp, TEMP_HISTORY)
+    except OSError:
+        pass  # график — украшение, из-за него ничего ломаться не должно
+
+
+async def _iio(dev, chan):
+    proc = await asyncio.create_subprocess_exec(
+        "iio_attr", "-u", f"ip:{PLUTO_HOST}", "-c", dev, chan,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    vals = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        m = re.search(r"attr '(\w+)', value '([-\d.]+)'", line)
+        if m:
+            vals[m.group(1)] = float(m.group(2))
+    return vals
+
+
+async def read_pluto_temps():
+    """AD9363 отдаёт милliградусы напрямую. XADC — сырой отсчёт, который надо
+    пересчитать по своим же offset и scale: (raw + offset) * scale / 1000."""
+    rf = soc = None
+    try:
+        v = await _iio("ad9361-phy", "temp0")
+        if "input" in v:
+            rf = round(v["input"] / 1000.0, 1)
+    except Exception:
+        pass
+    try:
+        v = await _iio("xadc", "temp0")
+        if {"raw", "offset", "scale"} <= set(v):
+            soc = round((v["raw"] + v["offset"]) * v["scale"] / 1000.0, 1)
+    except Exception:
+        pass
+    return rf, soc
+
+
+async def temp_poller():
+    if not PLUTO_HOST:
+        return
+    while True:
+        rf, soc = await read_pluto_temps()
+        if rf is not None or soc is not None:
+            TEMPS.append({"ts": now(), "rf": rf, "soc": soc})
+            save_temps()
+            await broadcast()
+        await asyncio.sleep(TEMP_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -859,12 +942,14 @@ async def main():
     ):
         print(f"tetra-dash: телеметрия :{TELEMETRY_PORT}, управление :{CONTROL_PORT}, "
               f"панель {DASH_BIND}:{HTTP_PORT} ({auth_note})", flush=True)
+        load_temps()
         CALLSIGNS.update(load_callsigns())
         if CALLSIGNS:
             STATE.event("callsign", f"кэш позывных: {len(CALLSIGNS)} записей", "сервис")
         STATE.event("link", "сервис запущен", "сервис")
         await resync_subscribers()
-        await asyncio.gather(journal_reader(), station_watcher(), callsign_resolver())
+        await asyncio.gather(journal_reader(), station_watcher(),
+                             callsign_resolver(), temp_poller())
 
 
 if __name__ == "__main__":

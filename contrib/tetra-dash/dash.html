@@ -75,6 +75,15 @@
   button:disabled { opacity: .45; cursor: not-allowed; }
   .note { color: var(--dim); font-size: 12px; margin-top: 8px; }
   .dim { color: var(--dim); }
+  .temps { display: flex; gap: 22px; margin-bottom: 10px; }
+  .t-val { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .t-val.warm { color: var(--warn); }
+  .t-val.hot  { color: var(--bad); }
+  .t-cap { display: block; font-size: 11px; color: var(--dim); }
+  #chart { width: 100%; height: 90px; display: block; }
+  #chart .grid { stroke: var(--line); stroke-width: .5; }
+  #chart .rf   { stroke: var(--accent); fill: none; stroke-width: 1.5; }
+  #chart .soc  { stroke: var(--warn);   fill: none; stroke-width: 1.5; }
   .result { margin-top: 8px; font-size: 13px; min-height: 1.4em; }
   .result.ok { color: var(--ok); }
   .result.bad { color: var(--bad); }
@@ -98,6 +107,17 @@
 </div>
 
 <div class="grid">
+
+  <div class="panel">
+    <h2>Температура Pluto</h2>
+    <div class="temps">
+      <div><span class="t-val" id="t-rf">—</span><span class="t-cap">радиотракт AD9363</span></div>
+      <div><span class="t-val" id="t-soc">—</span><span class="t-cap">кристалл Zynq</span></div>
+    </div>
+    <svg id="chart" viewBox="0 0 320 90" preserveAspectRatio="none" role="img"
+         aria-label="График температуры Pluto"></svg>
+    <div class="note" id="t-range">данных пока нет</div>
+  </div>
 
   <div class="panel">
     <h2>Управление станцией</h2>
@@ -208,6 +228,7 @@ function render(s) {
   $("ul").textContent = s.ul_freq;
   $("src").textContent = s.sds_source;
   $("cache-info").textContent = "в кэше записей: " + (s.callsign_cache ?? 0);
+  drawTemps(s);
 
   const st = stationWords(s);
   $("t-st").textContent = st.text;
@@ -267,6 +288,45 @@ function render(s) {
                    <span>${esc(e.text)}</span>`;
     log.appendChild(d);
   }
+}
+
+// График рисуем сами: панель работает без выхода в сеть, тянуть библиотеку
+// неоткуда, а для двух ломаных хватает и polyline.
+function drawTemps(s) {
+  const pts = s.temps || [];
+  const cur = s.temp_now;
+
+  for (const [id, key] of [["t-rf", "rf"], ["t-soc", "soc"]]) {
+    const el = $(id), v = cur ? cur[key] : null;
+    el.textContent = v == null ? "—" : v.toFixed(1) + " °C";
+    // Пороги грубые: AD9363 рассчитан примерно до 85, Zynq до 85–100.
+    el.className = "t-val" + (v == null ? "" : v >= 80 ? " hot" : v >= 70 ? " warm" : "");
+  }
+
+  const svg = $("chart");
+  if (pts.length < 2) { svg.innerHTML = ""; return; }
+
+  const W = 320, H = 90, PAD = 6;
+  const vals = pts.flatMap(p => [p.rf, p.soc]).filter(v => v != null);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (hi - lo < 4) { const m = (hi + lo) / 2; lo = m - 2; hi = m + 2; }
+  const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts || t0 + 1;
+
+  const x = p => PAD + (W - 2 * PAD) * (t1 === t0 ? 1 : (p.ts - t0) / (t1 - t0));
+  const y = v => PAD + (H - 2 * PAD) * (1 - (v - lo) / (hi - lo));
+  const line = key => pts.filter(p => p[key] != null)
+                        .map(p => x(p).toFixed(1) + "," + y(p[key]).toFixed(1)).join(" ");
+
+  svg.innerHTML =
+    `<line class="grid" x1="0" y1="${y(hi).toFixed(1)}" x2="${W}" y2="${y(hi).toFixed(1)}"/>` +
+    `<line class="grid" x1="0" y1="${y(lo).toFixed(1)}" x2="${W}" y2="${y(lo).toFixed(1)}"/>` +
+    `<polyline class="soc" points="${line("soc")}"/>` +
+    `<polyline class="rf" points="${line("rf")}"/>`;
+
+  const mins = Math.round((t1 - t0) / 60);
+  $("t-range").textContent =
+    `${lo.toFixed(1)}…${hi.toFixed(1)} °C за ${mins < 60 ? mins + " мин" : Math.round(mins / 60) + " ч"}, ` +
+    `${pts.length} измерений`;
 }
 
 function connect() {

@@ -45,6 +45,11 @@ async def main():
             print("  раций в соте нет")
         print("  позывных в кэше:", s.get("callsign_cache", 0))
 
+        t = s.get("temp_now")
+        if t:
+            print("  Pluto: радиотракт {} °C, кристалл {} °C  ({} измерений)".format(
+                t.get("rf"), t.get("soc"), len(s.get("temps") or [])))
+
         if arg in ("start", "stop"):
             await ws.send(json.dumps({"cmd": "station", "action": arg}))
             want = "station_result"
