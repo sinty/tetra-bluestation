@@ -98,6 +98,9 @@ CONTROL_PORT = cfg_int("DASH_CONTROL_PORT", 9002)
 DASH_USER = cfg("DASH_USER")
 DASH_PASSWORD = cfg("DASH_PASSWORD")
 SDS_SOURCE_ISSI = cfg_int("SDS_SOURCE_ISSI", 0)
+TX_WATCHDOG_MISSES = cfg_int("TX_WATCHDOG_MISSES", 500)
+TX_WATCHDOG_COOLDOWN = cfg_int("TX_WATCHDOG_COOLDOWN", 600)
+STARTUP_GRACE = cfg_int("TX_WATCHDOG_GRACE", 180)
 PLUTO_HOST = cfg("PLUTO_HOST")
 TEMP_INTERVAL = cfg_int("PLUTO_TEMP_INTERVAL", 30)
 TEMP_HISTORY = cfg("PLUTO_TEMP_HISTORY", "/var/lib/tetra-lab/pluto-temp.json")
@@ -136,6 +139,7 @@ class State:
         self.station = "неизвестно"      # из systemctl is-active
         self.station_wanted = False      # флаговый файл
         self.station_busy = ""           # "запускается" / "останавливается"
+        self.station_since = 0.0         # когда станция стала active
         self.subscribers = {}
         self.events = deque(maxlen=MAX_EVENTS)
         self.calls = deque(maxlen=50)
@@ -199,6 +203,7 @@ def snapshot():
         "callsign_cache": len(CALLSIGNS),
         "temps": list(TEMPS),
         "temp_now": TEMPS[-1] if TEMPS else None,
+        "tx_misses": tx_miss_rate(),
         "calls": list(STATE.calls),
         "events": list(STATE.events)[:120],
     }
@@ -339,6 +344,8 @@ async def station_watcher():
                 STATE.backhaul = backhaul
                 changed = True
 
+            if active == "active" and STATE.station != "active":
+                STATE.station_since = now()
             STATE.station = active
             STATE.station_wanted = wanted
             if changed:
@@ -688,6 +695,7 @@ async def reset_callsigns():
 # Журнал systemd как источник того, чего нет в телеметрии
 # ---------------------------------------------------------------------------
 
+RE_TX_LATE = re.compile(r"Too late to produce TX block")
 RE_BACKHAUL = re.compile(r"backhaul (CONNECTED|DISCONNECTED)")
 RE_GROUP_TX = re.compile(r"GROUP_TX uuid=(\S+?)\s+src=(\d+) dst=(\d+)")
 RE_LOCAL_CALL = re.compile(
@@ -698,6 +706,12 @@ RE_SUB_UPDATE = re.compile(
 
 def parse_journal_line(line):
     line = ANSI.sub("", line).rstrip()
+
+    # Пропуски передачи считаем, но событиями не засоряем: их бывают
+    # десятки тысяч в минуту, и каждый по отдельности ничего не значит.
+    if RE_TX_LATE.search(line):
+        TX_MISSES.append(now())
+        return None
 
     m = RE_BACKHAUL.search(line)
     if m:
@@ -804,6 +818,60 @@ async def resync_subscribers():
         names = ", ".join(str(i) for i in sorted(subs)) or "никого"
         STATE.event("resync", f"состав раций восстановлен из журнала: {names}", "сервис")
         await broadcast()
+
+
+TX_MISSES = deque(maxlen=100000)   # отметки времени пропусков передачи
+_last_watchdog_restart = 0.0
+
+
+def tx_miss_rate(window=60):
+    """Сколько пропусков передачи за последние `window` секунд."""
+    edge = now() - window
+    while TX_MISSES and TX_MISSES[0] < edge:
+        TX_MISSES.popleft()
+    return len(TX_MISSES)
+
+
+async def tx_watchdog():
+    """Перезапускает станцию, если она свалилась в шторм пропусков передачи.
+
+    Из этого состояния станция сама не выходит: она не падает, а бесконечно
+    догоняет упущенные дедлайны, поэтому Restart=always в юните не срабатывает.
+    Снаружи это выглядит как исправная станция, которая молчит в эфир, —
+    рация показывает отсутствие сети.
+
+    Причина запускается всплеском потерь сэмплов от Pluto: временная база
+    сбивается, и вернуть её умеет только перезапуск, при котором заново
+    поднимается и гаджет на Pluto.
+    """
+    global _last_watchdog_restart
+    if not TX_WATCHDOG_MISSES:
+        return
+    while True:
+        await asyncio.sleep(15)
+        rate = tx_miss_rate()
+        if rate < TX_WATCHDOG_MISSES:
+            continue
+        if STATE.station != "active" or not STATE.station_wanted:
+            continue  # оператор сам остановил — не лезем
+        # Подъём станции сам по себе даёт десятки тысяч пропусков, пока
+        # не установится поток от Pluto. Без этой проверки сторож принял бы
+        # штатный старт за аварию и устроил бы цикл перезапусков.
+        if now() - STATE.station_since < STARTUP_GRACE:
+            TX_MISSES.clear()
+            continue
+        if now() - _last_watchdog_restart < TX_WATCHDOG_COOLDOWN:
+            continue  # только что перезапускали, даём прийти в себя
+        _last_watchdog_restart = now()
+        TX_MISSES.clear()
+        STATE.event("error", f"шторм пропусков передачи ({rate} за минуту), "
+                             f"перезапускаю станцию", "сторож")
+        await notify(f"станция перестала передавать ({rate} пропусков за минуту), "
+                     f"перезапускаю")
+        await broadcast()
+        ok, err = await systemctl("restart")
+        if not ok:
+            STATE.event("error", f"сторож не смог перезапустить: {err}", "сторож")
 
 
 async def journal_reader():
@@ -949,7 +1017,7 @@ async def main():
         STATE.event("link", "сервис запущен", "сервис")
         await resync_subscribers()
         await asyncio.gather(journal_reader(), station_watcher(),
-                             callsign_resolver(), temp_poller())
+                             callsign_resolver(), temp_poller(), tx_watchdog())
 
 
 if __name__ == "__main__":

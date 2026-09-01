@@ -104,6 +104,7 @@
   <div class="chip"><span class="dot" id="d-tel"></span>телеметрия</div>
   <div class="chip"><span class="dot" id="d-ctl"></span>управление</div>
   <div class="chip"><span class="dot" id="d-ws"></span>панель</div>
+  <div class="chip"><span class="dot" id="d-tx"></span>передача: <span id="t-tx">—</span></div>
 </div>
 
 <div class="grid">
@@ -228,6 +229,11 @@ function render(s) {
   $("ul").textContent = s.ul_freq;
   $("src").textContent = s.sds_source;
   $("cache-info").textContent = "в кэше записей: " + (s.callsign_cache ?? 0);
+  // Пропуски передачи: ноль — норма, всё остальное значит, что станция
+  // молчит в эфир, даже если по всем прочим признакам исправна.
+  const miss = s.tx_misses ?? 0;
+  $("t-tx").textContent = miss ? miss + " пропусков/мин" : "без пропусков";
+  $("d-tx").className = "dot " + (miss === 0 ? "on" : miss < 100 ? "busy" : "off");
   drawTemps(s);
 
   const st = stationWords(s);
