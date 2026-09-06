@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import shlex
+import syslog
 import sys
 import time
 from collections import deque
@@ -148,12 +149,27 @@ class State:
         self.next_handle = 1
         self.control_ws = None
 
+    # Строки, которых бывает много и которые уже есть в журнале станции:
+    # дублировать их незачем.
+    NOISY = {"call", "mm", "callsign"}
+
     def event(self, kind, text, source):
         item = {"ts": now(), "kind": kind, "text": text, "source": source}
         self.events.appendleft(item)
+        # Дублируем в системный журнал. Без этого действия панели —
+        # в том числе перезапуски станции сторожем — не оставляют следа
+        # нигде, кроме её собственной памяти, и после перезапуска панели
+        # пропадают бесследно. Однажды это стоило часа поисков.
+        if kind not in self.NOISY:
+            try:
+                syslog.syslog(syslog.LOG_WARNING if kind == "error" else syslog.LOG_INFO,
+                              f"[{source}] {text}")
+            except Exception:
+                pass
         return item
 
 
+syslog.openlog("tetra-dash", syslog.LOG_PID, syslog.LOG_DAEMON)
 STATE = State()
 
 
