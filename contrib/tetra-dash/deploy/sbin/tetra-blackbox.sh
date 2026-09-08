@@ -1,71 +1,102 @@
 #!/bin/sh
-# Чёрный ящик: снимок состояния машины раз в N секунд, со сбросом на диск.
+# Чёрный ящик: снимок состояния машины раз в секунду, со сбросом на диск.
 #
-# Зачем: виртуалка дважды замирала бесследно. Детектор жёстких зависаний
+# Зачем: виртуалка семь раз замирала бесследно. Детектор жёстких зависаний
 # в KVM недоступен (нет аппаратного счётчика), журнал обрывается на полуслове,
 # и после ресета от последних секунд не остаётся ничего. Этот скрипт пишет
-# строку каждые N секунд и сразу сбрасывает её на диск, поэтому переживает
+# строку каждую секунду и сразу сбрасывает её на диск, поэтому переживает
 # внезапную смерть машины: последняя строка = последний момент, когда ядро
 # ещё работало.
 #
-# Ключевое поле — steal. Это время, которое у гостя отобрал гипервизор.
-# Рост steal перед обрывом означает, что задыхался ХОСТ, а не гость;
-# отсутствие роста при высокой нагрузке RT-потоков указывает внутрь.
+# Что и зачем пишем:
 #
-# Формат строки: пары «ключ=значение», разделённые пробелом.
+#   steal    время, отобранное гипервизором. Рост перед обрывом означает,
+#            что задыхался ХОСТ, а не гость.
+#   cpu0/1   загрузка по ядрам порознь. Станция заперта на нулевом; если
+#            умрёт только оно, а первое останется живым — это видно только так.
+#   psi_*    сколько времени задачи ждали ресурс. Поле full (в отличие от some)
+#            означает, что ждали ВСЕ — то есть машина встала целиком.
+#   dstate   потоки в непрерываемом ожидании. Их рост означает, что кто-то
+#            завис на вводе-выводе и не может быть прерван даже сигналом.
+#   irq      всего прерываний за интервал. Обвал к нулю означает, что ядро
+#            перестало их получать, — верный признак остановки вовне.
+#   netdrop  потери и ошибки на интерфейсе. Поток IQ от Pluto идёт по UDP,
+#            и его заминки вызывают штормы пропусков передачи.
+#
+# Интервал секунда, а не пять: при пятисекундном шаге короткая раскрутка
+# перед смертью просто не попадала в запись — все семь раз последний снимок
+# показывал совершенно спокойную машину.
 
 LOG=/var/log/tetra-blackbox.log
-INTERVAL=5
+INTERVAL=1
 UNIT_PROC=bluestation-bs
+IFACE=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+[ -n "$IFACE" ] || IFACE=eth0
 
-prev_total=0
-prev_idle=0
-prev_steal=0
+prev_total=0; prev_idle=0; prev_steal=0
+prev_c0t=0; prev_c0i=0; prev_c1t=0; prev_c1i=0
+prev_irq=0; prev_drop=0
+
+cpu_line() {   # $1 — имя строки в /proc/stat
+    awk -v k="$1" '$1==k {print $2+$3+$4+$5+$6+$7+$8+$9, $5}' /proc/stat
+}
 
 while :; do
     now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-    # --- процессор: доли за интервал, включая отобранное гипервизором ---
     set -- $(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat)
-    user=$1; nice=$2; sys=$3; idle=$4; iowait=$5; irq=$6; softirq=$7; steal=$8
-    total=$((user+nice+sys+idle+iowait+irq+softirq+steal))
-    d_total=$((total - prev_total))
-    d_idle=$((idle - prev_idle))
-    d_steal=$((steal - prev_steal))
+    total=$(($1+$2+$3+$4+$5+$6+$7+$8)); idle=$4; steal=$8
+    d_total=$((total-prev_total)); d_idle=$((idle-prev_idle)); d_steal=$((steal-prev_steal))
     if [ "$d_total" -gt 0 ]; then
-        busy_pct=$(( (d_total - d_idle) * 100 / d_total ))
-        steal_pct=$(( d_steal * 100 / d_total ))
+        busy=$(( (d_total-d_idle)*100/d_total )); steal_p=$(( d_steal*100/d_total ))
     else
-        busy_pct=-1; steal_pct=-1
+        busy=-1; steal_p=-1
     fi
     prev_total=$total; prev_idle=$idle; prev_steal=$steal
 
-    # --- нагрузка и память ---
-    load=$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' ',')
+    # по ядрам порознь
+    set -- $(cpu_line cpu0); c0t=${1:-0}; c0i=${2:-0}
+    d=$((c0t-prev_c0t)); di=$((c0i-prev_c0i))
+    [ "$d" -gt 0 ] && cpu0=$(( (d-di)*100/d )) || cpu0=-1
+    prev_c0t=$c0t; prev_c0i=$c0i
+    set -- $(cpu_line cpu1); c1t=${1:-0}; c1i=${2:-0}
+    d=$((c1t-prev_c1t)); di=$((c1i-prev_c1i))
+    [ "$d" -gt 0 ] && cpu1=$(( (d-di)*100/d )) || cpu1=-1
+    prev_c1t=$c1t; prev_c1i=$c1i
+
+    load=$(cut -d' ' -f1 /proc/loadavg)
     mem_avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
-    swap_free=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)
 
-    # --- давление ресурсов: сколько времени задачи ждали (PSI) ---
     psi_cpu=$(awk '/^some/{print $2}' /proc/pressure/cpu 2>/dev/null | cut -d= -f2)
-    psi_io=$(awk '/^some/{print $2}' /proc/pressure/io 2>/dev/null | cut -d= -f2)
-    psi_mem=$(awk '/^some/{print $2}' /proc/pressure/memory 2>/dev/null | cut -d= -f2)
+    psi_io=$(awk '/^full/{print $2}' /proc/pressure/io 2>/dev/null | cut -d= -f2)
+    psi_mem=$(awk '/^full/{print $2}' /proc/pressure/memory 2>/dev/null | cut -d= -f2)
 
-    # --- станция: сколько процессорного времени съели её потоки ---
+    # потоки в непрерываемом ожидании — признак залипания на вводе-выводе
+    dstate=$(awk '$3=="D"' /proc/*/stat 2>/dev/null | wc -l)
+
+    # прерывания: обвал к нулю = ядро перестало их получать
+    irq=$(awk '/^intr /{print $2}' /proc/stat)
+    d_irq=$((irq-prev_irq)); prev_irq=$irq
+    [ "$d_irq" -lt 0 ] && d_irq=0
+
+    # потери на интерфейсе к Pluto
+    drop=$(awk -v i="$IFACE:" '$1==i {print $4+$5+$12+$13}' /proc/net/dev)
+    drop=${drop:-0}
+    d_drop=$((drop-prev_drop)); prev_drop=$drop
+    [ "$d_drop" -lt 0 ] && d_drop=0
+
     pid=$(pgrep -x "$UNIT_PROC" 2>/dev/null | head -1)
     if [ -n "$pid" ]; then
-        st_jiffies=$(awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null)
-        st_threads=$(ls "/proc/$pid/task" 2>/dev/null | wc -l)
-        st_rt=$(for t in /proc/"$pid"/task/*/stat; do
-                    awk '{ if ($41 == 1 || $41 == 2) print $1 }' "$t" 2>/dev/null
-                done | wc -l)
+        bs_cpu=$(awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null)
+        bs_thr=$(ls "/proc/$pid/task" 2>/dev/null | wc -l)
     else
-        st_jiffies=-1; st_threads=0; st_rt=0
+        bs_cpu=-1; bs_thr=0
     fi
 
-    printf '%s busy=%s%% steal=%s%% load=%s mem_avail=%sM swap_free=%sM psi_cpu=%s psi_io=%s psi_mem=%s bs_cpu=%s bs_threads=%s bs_rt=%s\n' \
-        "$now" "$busy_pct" "$steal_pct" "$load" "$mem_avail" "$swap_free" \
+    printf '%s busy=%s%% steal=%s%% cpu0=%s%% cpu1=%s%% load=%s mem=%sM psi_cpu=%s psi_io_full=%s psi_mem_full=%s dstate=%s irq=%s netdrop=%s bs_cpu=%s bs_thr=%s\n' \
+        "$now" "$busy" "$steal_p" "$cpu0" "$cpu1" "$load" "$mem_avail" \
         "${psi_cpu:--}" "${psi_io:--}" "${psi_mem:--}" \
-        "$st_jiffies" "$st_threads" "$st_rt" >> "$LOG"
+        "$dstate" "$d_irq" "$d_drop" "$bs_cpu" "$bs_thr" >> "$LOG"
 
     # Без сброса на диск строка останется в кэше и при зависании пропадёт —
     # то есть ровно те секунды, ради которых всё это и затевалось.

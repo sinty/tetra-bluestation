@@ -112,6 +112,19 @@ qm set <VMID> -watchdog model=i6300esb,action=reset
 
 Проверка, что устройство появилось: `ls -l /dev/watchdog`.
 
+## 9. Чёрный ящик
+
+```sh
+sudo install -m 0755 sbin/tetra-blackbox.sh /usr/local/sbin/
+sudo install -m 0644 systemd/tetra-blackbox.service /etc/systemd/system/
+sudo install -m 0644 tetra-blackbox.logrotate /etc/logrotate.d/tetra-blackbox
+sudo systemctl daemon-reload && sudo systemctl enable --now tetra-blackbox
+```
+
+Пишет раз в секунду со сбросом на диск, около 14 МБ в сутки, хранится неделя.
+Ротация обязательно с `copytruncate`: скрипт держит файл открытым и не умеет
+переоткрывать его по сигналу.
+
 ## Проверка
 
 ```sh
