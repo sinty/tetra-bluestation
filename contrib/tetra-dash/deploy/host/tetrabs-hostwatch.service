@@ -1,0 +1,21 @@
+[Unit]
+Description=Наблюдение за виртуалкой станции со стороны хоста
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tetrabs-hostwatch.sh
+Restart=always
+RestartSec=5
+
+# Номер виртуальной машины и куда писать
+Environment=VMID=121
+Environment=LOG=/var/log/tetrabs-hostwatch.log
+Environment=INTERVAL=1
+
+# Наблюдатель не должен мешать тому, за чем наблюдает
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
