@@ -80,10 +80,21 @@
   .t-val.warm { color: var(--warn); }
   .t-val.hot  { color: var(--bad); }
   .t-cap { display: block; font-size: 11px; color: var(--dim); }
-  #chart { width: 100%; height: 90px; display: block; }
-  #chart .grid { stroke: var(--line); stroke-width: .5; }
-  #chart .rf   { stroke: var(--accent); fill: none; stroke-width: 1.5; }
-  #chart .soc  { stroke: var(--warn);   fill: none; stroke-width: 1.5; }
+  [hidden] { display: none !important; }
+  .wide { grid-column: 1 / -1; }
+  .table-scroll { overflow-x: auto; }
+  .dot.warn { background: var(--warn); }
+  .qdot { display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .chart .b-ok   { fill: var(--ok); }
+  .chart .b-warn { fill: var(--warn); }
+  .chart .b-bad  { fill: var(--bad); }
+  .chart .thr    { stroke: var(--warn); stroke-width: .7; stroke-dasharray: 3 3; }
+  .t-val.bad { color: var(--bad); }
+  .chart { width: 100%; height: 90px; display: block; }
+  .chart .grid { stroke: var(--line); stroke-width: .5; }
+  .chart .rf   { stroke: var(--accent); fill: none; stroke-width: 1.5; }
+  .chart .soc  { stroke: var(--warn);   fill: none; stroke-width: 1.5; }
+  .chart .cpu  { stroke: var(--ok);     fill: none; stroke-width: 1.5; }
   .result { margin-top: 8px; font-size: 13px; min-height: 1.4em; }
   .result.ok { color: var(--ok); }
   .result.bad { color: var(--bad); }
@@ -115,9 +126,20 @@
       <div><span class="t-val" id="t-rf">—</span><span class="t-cap">радиотракт AD9363</span></div>
       <div><span class="t-val" id="t-soc">—</span><span class="t-cap">кристалл Zynq</span></div>
     </div>
-    <svg id="chart" viewBox="0 0 320 90" preserveAspectRatio="none" role="img"
+    <svg id="chart" class="chart" viewBox="0 0 320 90" preserveAspectRatio="none" role="img"
          aria-label="График температуры Pluto"></svg>
     <div class="note" id="t-range">данных пока нет</div>
+  </div>
+
+  <div class="panel" id="host-panel" hidden>
+    <h2>Температура платы <span class="dim" id="h-name"></span></h2>
+    <div class="temps">
+      <div><span class="t-val" id="h-cpu">—</span><span class="t-cap">процессор</span></div>
+      <div><span class="t-val" id="h-fan">—</span><span class="t-cap">вентилятор, ступень</span></div>
+    </div>
+    <svg id="hchart" class="chart" viewBox="0 0 320 90" preserveAspectRatio="none" role="img"
+         aria-label="График температуры платы"></svg>
+    <div class="note" id="h-range">данных пока нет</div>
   </div>
 
   <div class="panel">
@@ -125,6 +147,7 @@
     <form id="ctl">
       <button type="button" id="b-start">Пуск</button>
       <button type="button" id="b-stop" class="danger">Стоп</button>
+      <button type="button" id="b-power" class="danger" style="margin-left:auto">Выключить питание</button>
     </form>
     <div class="result" id="ctl-result"></div>
     <div class="note">
@@ -144,13 +167,33 @@
     <div class="empty" id="subs-empty">ни одна рация не зарегистрирована</div>
   </div>
 
-  <div class="panel">
+  <div class="panel wide">
     <h2>Последние вызовы</h2>
+    <div class="table-scroll">
     <table>
-      <thead><tr><th>Время</th><th>Направление</th><th>Кто</th><th>Группа</th></tr></thead>
+      <thead><tr><th>Время</th><th>Направление</th><th>Кто</th><th>Группа</th>
+                 <th>Длит.</th><th>Звук из сети</th></tr></thead>
       <tbody id="calls"></tbody>
     </table>
+    </div>
     <div class="empty" id="calls-empty">вызовов пока не было</div>
+  </div>
+
+  <div class="panel">
+    <h2>Звук из сети · за час</h2>
+    <div class="temps">
+      <div><span class="t-val" id="n-calls">—</span><span class="t-cap">вызовов</span></div>
+      <div><span class="t-val" id="n-bad">—</span><span class="t-cap">звук рвался</span></div>
+      <div><span class="t-val" id="n-jit">—</span><span class="t-cap">худший джиттер</span></div>
+    </div>
+    <svg id="nchart" class="chart" viewBox="0 0 320 90" preserveAspectRatio="none" role="img"
+         aria-label="Джиттер по последним вызовам из сети"></svg>
+    <div class="note">
+      Столбик — передача из сети, высота — худший джиттер, пунктир — 20 мс.
+      Зелёный — чисто, жёлтый — один провал звука (~0.3 с) или буфер рос,
+      красный — провалов несколько или кадры потеряны. Перекодирование DMR↔TETRA
+      идёт на сервере TetraPack; здесь видно только, как звук дошёл до станции.
+    </div>
   </div>
 
   <div class="panel">
@@ -235,6 +278,7 @@ function render(s) {
   $("t-tx").textContent = miss ? miss + " пропусков/мин" : "без пропусков";
   $("d-tx").className = "dot " + (miss === 0 ? "on" : miss < 100 ? "busy" : "off");
   drawTemps(s);
+  drawHost(s);
 
   const st = stationWords(s);
   $("t-st").textContent = st.text;
@@ -243,6 +287,7 @@ function render(s) {
 
   $("b-start").disabled = !!s.station_busy || s.station === "active";
   $("b-stop").disabled = !!s.station_busy || s.station !== "active";
+  $("b-power").disabled = !!s.station_busy;
 
   dot($("d-tel"), s.telemetry_link);
   dot($("d-ctl"), s.control_link);
@@ -274,15 +319,18 @@ function render(s) {
 
   const calls = $("calls");
   calls.innerHTML = "";
-  for (const c of s.calls.slice(0, 12)) {
+  for (const c of s.calls.slice(0, 15)) {
     const tr = document.createElement("tr");
     const who = state.callsigns && state.callsigns[c.src]
       ? `${c.src} <span class=dim>${esc(state.callsigns[c.src])}</span>` : c.src;
     tr.innerHTML = `<td>${hhmmss(c.ts)}</td><td>${c.dir}</td>
-                    <td>${who}</td><td>${c.dst}</td>`;
+                    <td>${who}</td><td>${c.dst}</td>
+                    <td>${c.end ? fmtDur(c.end - c.ts) : "—"}</td>
+                    <td title="${esc(qualityTitle(c))}">${qualityCell(c)}</td>`;
     calls.appendChild(tr);
   }
   $("calls-empty").style.display = s.calls.length ? "none" : "block";
+  drawNet(s);
 
   const log = $("log");
   log.innerHTML = "";
@@ -296,24 +344,102 @@ function render(s) {
   }
 }
 
-// График рисуем сами: панель работает без выхода в сеть, тянуть библиотеку
-// неоткуда, а для двух ломаных хватает и polyline.
-function drawTemps(s) {
-  const pts = s.temps || [];
-  const cur = s.temp_now;
+function fmtDur(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return s < 60 ? s + " с" : Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
 
+const Q_DOT = { ok: "on", warn: "warn", bad: "off" };
+
+function qualityCell(c) {
+  if (c.q === "sent") return `<span class=dim>ушло ${c.frames ?? "?"} кадров</span>`;
+  if (c.q === "live" || !c.q) {
+    // Вызов без завершения старше 10 минут — завершение потерялось
+    return Date.now() / 1000 - c.ts > 600 ? "<span class=dim>нет данных</span>"
+                                          : "<span class=dim>идёт…</span>";
+  }
+  const jit = c.jitter_ms ? ` · ${c.jitter_ms.toFixed(0)} мс` : "";
+  const text = c.q === "ok" ? "чисто" + jit
+    : c.q === "warn" ? (c.underruns === 1 ? "1 провал" : "буфер рос") + jit
+    : c.drops ? `потеряно ${c.drops} кадров` : `${c.underruns} провалов${jit}`;
+  return `<span class="dot qdot ${Q_DOT[c.q]}"></span>${text}`;
+}
+
+function qualityTitle(c) {
+  if (!c.end) return "";
+  const parts = [`кадров ${c.frames ?? "?"}`];
+  if (c.dir === "из сети") {
+    parts.push(`провалов ${c.underruns || 0}`, `выброшено ${c.drops || 0}`);
+    if (c.jitter_ms) parts.push(`джиттер до ${c.jitter_ms.toFixed(1)} мс`);
+    if (c.target) parts.push(`буфер до ${c.target} кадров`);
+  }
+  return parts.join(", ");
+}
+
+function drawNet(s) {
+  const nq = s.net_quality || {};
+  $("n-calls").textContent = nq.calls ?? "—";
+  $("n-bad").textContent = nq.calls ? nq.bad : "—";
+  $("n-bad").className = "t-val" + (nq.bad ? " bad" : "");
+  $("n-jit").textContent = nq.calls ? nq.jitter_max.toFixed(0) + " мс" : "—";
+
+  // Последние завершённые передачи из сети, старые слева
+  const done = s.calls.filter(c => c.dir === "из сети" && c.end).slice(0, 30).reverse();
+  const svg = $("nchart");
+  if (!done.length) { svg.innerHTML = ""; return; }
+  const W = 320, H = 90, PAD = 4, THR = 20;
+  const top = Math.max(40, ...done.map(c => c.jitter_ms || 0));
+  const y = v => H - PAD - (H - 2 * PAD) * Math.min(v, top) / top;
+  const slot = (W - 2 * PAD) / 30, bw = Math.max(2, slot * 0.7);
+  svg.innerHTML =
+    `<line class="thr" x1="0" x2="${W}" y1="${y(THR).toFixed(1)}" y2="${y(THR).toFixed(1)}"/>` +
+    done.map((c, i) => {
+      const h = Math.max(3, H - PAD - y(c.jitter_ms || 0));
+      const x = PAD + slot * (30 - done.length + i) + (slot - bw) / 2;
+      return `<rect class="b-${c.q}" x="${x.toFixed(1)}" y="${(H - PAD - h).toFixed(1)}" ` +
+             `width="${bw.toFixed(1)}" height="${h.toFixed(1)}"><title>${esc(
+               hhmmss(c.ts) + " " + c.src + " → " + c.dst + ": " + qualityTitle(c))}</title></rect>`;
+    }).join("");
+}
+
+function tempClass(v) {
+  return "t-val" + (v == null ? "" : v >= 80 ? " hot" : v >= 70 ? " warm" : "");
+}
+
+function drawTemps(s) {
+  const cur = s.temp_now;
   for (const [id, key] of [["t-rf", "rf"], ["t-soc", "soc"]]) {
     const el = $(id), v = cur ? cur[key] : null;
     el.textContent = v == null ? "—" : v.toFixed(1) + " °C";
     // Пороги грубые: AD9363 рассчитан примерно до 85, Zynq до 85–100.
-    el.className = "t-val" + (v == null ? "" : v >= 80 ? " hot" : v >= 70 ? " warm" : "");
+    el.className = tempClass(v);
   }
+  drawChart($("chart"), $("t-range"), s.temps || [], ["soc", "rf"]);
+}
 
-  const svg = $("chart");
-  if (pts.length < 2) { svg.innerHTML = ""; return; }
+// Плитка машины, на которой работает станция. На виртуалке датчиков нет,
+// сервер ничего не присылает — и плитка остаётся скрытой.
+function drawHost(s) {
+  const pts = s.host_temps || [], cur = s.host_now;
+  $("host-panel").hidden = !cur;
+  if (!cur) return;
+  $("h-name").textContent = s.host_name ? "· " + s.host_name : "";
+  const el = $("h-cpu");
+  el.textContent = cur.cpu == null ? "—" : cur.cpu.toFixed(1) + " °C";
+  // Raspberry Pi начинает снижать частоту процессора с 80 °C
+  el.className = tempClass(cur.cpu);
+  $("h-fan").textContent = cur.fan == null ? "—"
+    : cur.fan === 0 ? "выкл" : `${cur.fan} из ${cur.fan_max}`;
+  drawChart($("hchart"), $("h-range"), pts, ["cpu"]);
+}
+
+// График рисуем сами: панель работает без выхода в сеть, тянуть библиотеку
+// неоткуда, а для пары ломаных хватает и polyline.
+function drawChart(svg, rangeEl, pts, keys) {
+  const vals = pts.flatMap(p => keys.map(k => p[k])).filter(v => v != null);
+  if (pts.length < 2 || !vals.length) { svg.innerHTML = ""; return; }
 
   const W = 320, H = 90, PAD = 6;
-  const vals = pts.flatMap(p => [p.rf, p.soc]).filter(v => v != null);
   let lo = Math.min(...vals), hi = Math.max(...vals);
   if (hi - lo < 4) { const m = (hi + lo) / 2; lo = m - 2; hi = m + 2; }
   const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts || t0 + 1;
@@ -326,11 +452,10 @@ function drawTemps(s) {
   svg.innerHTML =
     `<line class="grid" x1="0" y1="${y(hi).toFixed(1)}" x2="${W}" y2="${y(hi).toFixed(1)}"/>` +
     `<line class="grid" x1="0" y1="${y(lo).toFixed(1)}" x2="${W}" y2="${y(lo).toFixed(1)}"/>` +
-    `<polyline class="soc" points="${line("soc")}"/>` +
-    `<polyline class="rf" points="${line("rf")}"/>`;
+    keys.map(k => `<polyline class="${k}" points="${line(k)}"/>`).join("");
 
   const mins = Math.round((t1 - t0) / 60);
-  $("t-range").textContent =
+  rangeEl.textContent =
     `${lo.toFixed(1)}…${hi.toFixed(1)} °C за ${mins < 60 ? mins + " мин" : Math.round(mins / 60) + " ч"}, ` +
     `${pts.length} измерений`;
 }
@@ -352,6 +477,11 @@ function connect() {
       r.className = "result " + (msg.ok ? "ok" : "bad");
       r.textContent = msg.ok ? "Кэш сброшен, опрашиваю справочник заново."
                              : "Не вышло: " + msg.error;
+    } else if (msg.type === "power_result") {
+      const r = $("ctl-result");
+      r.className = "result " + (msg.ok ? "ok" : "bad");
+      r.textContent = msg.ok ? "Машина выключается. Панель сейчас пропадёт."
+                             : "Выключить не удалось: " + msg.error;
     } else if (msg.type === "station_result") {
       const r = $("ctl-result");
       r.className = "result " + (msg.ok ? "ok" : "bad");
@@ -379,6 +509,25 @@ $("b-stop").onclick = () => {
   $("ctl-result").className = "result";
   $("ctl-result").textContent = "Останавливаю…";
   ws.send(JSON.stringify({ cmd: "station", action: "stop" }));
+};
+
+// Выключение машины. Обратно её включает только человек рядом с ней,
+// поэтому одного случайного клика мало — нужно набрать слово.
+$("b-power").onclick = () => {
+  const word = prompt("Выключить питание машины станции?\n\n" +
+    "Станция штатно остановится и замолчит, панель пропадёт. " +
+    "Включить обратно можно только физически — переподключив питание. " +
+    "После включения станция поднимется сама, если сейчас она включена.\n\n" +
+    "Для подтверждения введите: выключить");
+  if (word === null) return;
+  if (word.trim().toLowerCase() !== "выключить") {
+    $("ctl-result").className = "result bad";
+    $("ctl-result").textContent = "Не подтверждено — питание не выключено.";
+    return;
+  }
+  $("ctl-result").className = "result";
+  $("ctl-result").textContent = "Выключаю питание…";
+  ws.send(JSON.stringify({ cmd: "power", action: "off" }));
 };
 
 $("sds").onsubmit = ev => {

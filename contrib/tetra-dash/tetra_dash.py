@@ -106,6 +106,8 @@ PLUTO_HOST = cfg("PLUTO_HOST")
 TEMP_INTERVAL = cfg_int("PLUTO_TEMP_INTERVAL", 30)
 TEMP_HISTORY = cfg("PLUTO_TEMP_HISTORY", "/var/lib/tetra-lab/pluto-temp.json")
 TEMP_POINTS = cfg_int("PLUTO_TEMP_POINTS", 720)
+# История температуры самой машины — тот же шаг и та же длина, что у Pluto
+HOST_TEMP_HISTORY = cfg("HOST_TEMP_HISTORY", "/var/lib/tetra-lab/host-temp.json")
 CALLSIGN_URL = cfg("CALLSIGN_URL")
 CALLSIGN_CACHE = cfg("CALLSIGN_CACHE", "/var/lib/tetra-lab/callsigns.json")
 DL_FREQ = cfg("DL_FREQ_MHZ", "?")
@@ -143,7 +145,9 @@ class State:
         self.station_since = 0.0         # когда станция стала active
         self.subscribers = {}
         self.events = deque(maxlen=MAX_EVENTS)
-        self.calls = deque(maxlen=50)
+        # Держим больше, чем показываем: сводка качества считается за час,
+        # а в оживлённой группе это под сотню передач.
+        self.calls = deque(maxlen=300)
         self.browsers = set()
         self.pending = {}
         self.next_handle = 1
@@ -219,8 +223,12 @@ def snapshot():
         "callsign_cache": len(CALLSIGNS),
         "temps": list(TEMPS),
         "temp_now": TEMPS[-1] if TEMPS else None,
+        "host_name": os.uname().nodename,
+        "host_temps": list(HOST_TEMPS),
+        "host_now": HOST_TEMPS[-1] if HOST_TEMPS else None,
         "tx_misses": tx_miss_rate(),
-        "calls": list(STATE.calls),
+        "calls": list(STATE.calls)[:50],
+        "net_quality": net_quality(),
         "events": list(STATE.events)[:120],
     }
 
@@ -270,6 +278,9 @@ async def station_control(action):
             # Флаг ставим ПЕРЕД запуском: ConditionPathExists проверяется
             # при каждой попытке, включая автоматические перезапуски.
             open(STATION_FLAG, "w").close()
+            # Сразу на диск: на SD-карте ФС сбрасывает изменения раз в 10 минут,
+            # и решение оператора не должно пропасть при отключении питания.
+            os.sync()
         except OSError as e:
             return {"ok": False, "error": f"не записать флаг {STATION_FLAG}: {e}"}
 
@@ -297,6 +308,7 @@ async def station_control(action):
         # передумать между удалением файла и командой стоп.
         try:
             os.unlink(STATION_FLAG)
+            os.sync()
         except FileNotFoundError:
             pass
         except OSError as e:
@@ -305,6 +317,39 @@ async def station_control(action):
         return {"ok": True}
 
     return {"ok": False, "error": f"неизвестное действие {action}"}
+
+
+async def power_off():
+    """Выключение машины кнопкой в панели.
+
+    Станцию отдельно не останавливаем: systemd при выключении сам штатно
+    гасит все юниты по порядку, включая ExecStopPost станции. Флаг «станция
+    нужна» не трогаем — после включения питания всё вернётся как было.
+
+    Включить машину обратно можно только физически, поэтому уведомление
+    уходит ДО команды: потом сети уже не будет. Право на выключение даёт
+    правило polkit, sudo не нужен.
+    """
+    if STATE.station_busy:
+        return {"ok": False, "error": f"станция {STATE.station_busy}, подождите"}
+    STATE.station_busy = "выключается питание"
+    STATE.event("control", "оператор выключает питание машины", "панель")
+    await broadcast()
+    await notify("оператор выключил питание с панели. Включить обратно — только "
+                 "переподключением питания")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "poweroff",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(err.decode("utf-8", "replace").strip() or "неизвестная ошибка")
+    except Exception as e:
+        STATE.station_busy = ""
+        STATE.event("error", f"выключение не удалось: {e}", "панель")
+        await notify(f"выключение питания не удалось: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
 
 
 async def backhaul_socket_up():
@@ -461,14 +506,31 @@ async def control_handler(ws):
         await broadcast()
 
 
+_sds_mr = 0   # номер сообщения SDS-TL, 0…255 по кругу
+
+
 def build_sds_text(text):
-    """SDS-TL текстовое сообщение: протокольный идентификатор 0x82,
-    затем схема кодирования. Латиница влезает в 8-битную (0x01),
-    кириллица требует UCS-2 (0x1A) и вдвое больше места."""
+    """Текстовое сообщение SDS-TL (ETSI EN 300 392-2, п. 29.4):
+
+        0x82     протокол «текст через SDS-TL»
+        0x00     SDS-TRANSFER: тип 0000, отчёт о доставке не нужен,
+                 без короткого отчёта, без хранения и пересылки
+        MR       номер сообщения
+        кодировка: 0x01 — ISO 8859-1 (латиница), 0x1A — UCS-2 (кириллица,
+                 вдвое длиннее); старший бит — «есть метка времени», у нас 0
+        текст
+
+    Раньше здесь не было байтов SDS-TRANSFER и номера: за 0x82 сразу шла
+    кодировка. Рация пакет принимала и подтверждала на канальном уровне,
+    но разобрать не могла и молча выбрасывала — на экране ничего.
+    """
+    global _sds_mr
+    _sds_mr = (_sds_mr + 1) % 256
+    head = bytes([0x82, 0x00, _sds_mr])
     try:
-        return bytes([0x82, 0x01]) + text.encode("ascii")
+        return head + bytes([0x01]) + text.encode("ascii")
     except UnicodeEncodeError:
-        return bytes([0x82, 0x1A]) + text.encode("utf-16-be")
+        return head + bytes([0x1A]) + text.encode("utf-16-be")
 
 
 async def send_sds(dest_ssi, text, dest_is_group=False):
@@ -521,24 +583,25 @@ async def send_sds(dest_ssi, text, dest_is_group=False):
 # рост радиотракта при спокойном SoC означает проблему в передаче, а общий
 # подъём — что коробке нечем дышать.
 
-TEMPS = deque(maxlen=TEMP_POINTS)   # [{"ts":…, "rf":…, "soc":…}]
+TEMPS = deque(maxlen=TEMP_POINTS)        # [{"ts":…, "rf":…, "soc":…}]
+HOST_TEMPS = deque(maxlen=TEMP_POINTS)   # [{"ts":…, "cpu":…, "fan":…, "fan_max":…}]
 
 
-def load_temps():
+def load_temps(path, dq):
     try:
-        with open(TEMP_HISTORY, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             for item in json.load(f)[-TEMP_POINTS:]:
-                TEMPS.append(item)
+                dq.append(item)
     except (OSError, ValueError):
         pass
 
 
-def save_temps():
-    tmp = TEMP_HISTORY + ".tmp"
+def save_temps(path, dq):
+    tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(list(TEMPS), f)
-        os.replace(tmp, TEMP_HISTORY)
+            json.dump(list(dq), f)
+        os.replace(tmp, path)
     except OSError:
         pass  # график — украшение, из-за него ничего ломаться не должно
 
@@ -582,7 +645,60 @@ async def temp_poller():
         rf, soc = await read_pluto_temps()
         if rf is not None or soc is not None:
             TEMPS.append({"ts": now(), "rf": rf, "soc": soc})
-            save_temps()
+            save_temps(TEMP_HISTORY, TEMPS)
+            await broadcast()
+        await asyncio.sleep(TEMP_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Температура машины, на которой работает станция
+# ---------------------------------------------------------------------------
+#
+# На Raspberry Pi — датчик процессора и ступень вентилятора из термоподсистемы
+# ядра. У виртуалки термозон нет: опрос тогда молча выключается, и плитка
+# в панели не показывается.
+
+THERMAL = "/sys/class/thermal"
+
+
+def _read_sys(path):
+    try:
+        with open(path, encoding="ascii") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_host_temp():
+    """Температура процессора в °C и ступень вентилятора (текущая, наибольшая)."""
+    cpu = fan = fan_max = None
+    try:
+        names = sorted(os.listdir(THERMAL))
+    except OSError:
+        return cpu, fan, fan_max
+    for name in names:
+        raw = _read_sys(f"{THERMAL}/{name}/temp") if name.startswith("thermal_zone") else None
+        if raw and raw.lstrip("-").isdigit():
+            cpu = round(int(raw) / 1000.0, 1)
+            break
+    for name in names:
+        if name.startswith("cooling_device") and "fan" in (_read_sys(f"{THERMAL}/{name}/type") or ""):
+            cur = _read_sys(f"{THERMAL}/{name}/cur_state")
+            top = _read_sys(f"{THERMAL}/{name}/max_state")
+            if cur and cur.isdigit() and top and top.isdigit():
+                fan, fan_max = int(cur), int(top)
+            break
+    return cpu, fan, fan_max
+
+
+async def host_temp_poller():
+    if read_host_temp()[0] is None:
+        return  # виртуалка: датчиков нет
+    while True:
+        cpu, fan, fan_max = read_host_temp()
+        if cpu is not None:
+            HOST_TEMPS.append({"ts": now(), "cpu": cpu, "fan": fan, "fan_max": fan_max})
+            save_temps(HOST_TEMP_HISTORY, HOST_TEMPS)
             await broadcast()
         await asyncio.sleep(TEMP_INTERVAL)
 
@@ -713,11 +829,78 @@ async def reset_callsigns():
 
 RE_TX_LATE = re.compile(r"Too late to produce TX block")
 RE_BACKHAUL = re.compile(r"backhaul (CONNECTED|DISCONNECTED)")
-RE_GROUP_TX = re.compile(r"GROUP_TX uuid=(\S+?)\s+src=(\d+) dst=(\d+)")
+# «sent GROUP_TX» — отладочная строка о НАШЕЙ передаче в сеть; без исключения
+# она превращалась бы в фантомный вызов «из сети».
+RE_GROUP_TX = re.compile(r"(?<!sent )GROUP_TX uuid=(\S+?)\s+src=(\d+) dst=(\d+)")
 RE_LOCAL_CALL = re.compile(
     r"forwarding local call to TetraPack: call_id=(\d+) src=(\d+) gssi=(\d+)")
 RE_SUB_UPDATE = re.compile(
     r"MmSubscriberUpdate \{ issi: (\d+), groups: \[([^\]]*)\], action: (\w+)")
+RE_CALL_ENDED = re.compile(
+    r"group call ended uuid=(\S+) call_id=(?:Some\((\d+)\)|None) gssi=\d+ frames=(\d+)")
+RE_LOCAL_STOP = re.compile(r"local call transmission stopped.*?uuid=(\S+) frames=(\d+)")
+RE_JITTER = re.compile(
+    r"high jitter on uuid=(\S+) target_frames=(\d+) queue=\d+ "
+    r"underruns=(\d+) overflow_drops=(\d+) jitter_ms=([\d.]+)")
+
+
+# ---------------------------------------------------------------------------
+# Качество звука из сети по вызовам
+# ---------------------------------------------------------------------------
+#
+# Станция не пишет статистику по каждой передаче, но прохождение звука
+# видно по двум строкам журнала:
+#
+#   group call ended … call_id=Some(N) … frames=N — сколько речевых кадров
+#       пришло. Счётчик живёт на канале, а не на передаче: при смене говорящего
+#       в том же канале он продолжается (5495, затем 5541). Кадры конкретной
+#       передачи — разность с прошлым значением того же call_id.
+#
+#   high jitter … underruns=N overflow_drops=N jitter_ms=X — буфер против
+#       рывков сети. Пишется не чаще раза в 5 с и только когда что-то не так.
+#       Провал (underrun) — буфер опустел, звук встаёт на время, пока он снова
+#       наберёт несколько кадров, это около трети секунды. Выброшенные кадры
+#       (overflow_drops) — буфер переполнился, кусок речи потерян.
+#
+# Замечено на живом трафике: один провал бывает почти в каждой передаче.
+# Поэтому один — «жёлтый», а «красный» — от двух или при выброшенных кадрах.
+
+JITTER_WARN_MS = 20.0       # около трети интервала кадра (56.7 мс)
+CALL_FRAMES = {}            # call_id → (время, frames) последнего завершения
+
+
+def call_quality(call):
+    if call["dir"] != "из сети":
+        return "sent" if call.get("end") else "live"
+    if call.get("end") is None:
+        return "live"
+    if call.get("drops", 0) > 0 or call.get("underruns", 0) >= 2:
+        return "bad"
+    if (call.get("underruns", 0) == 1 or (call.get("jitter_ms") or 0) >= JITTER_WARN_MS
+            or (call.get("target") or 0) >= 8):
+        return "warn"
+    return "ok"
+
+
+def find_call(uuid):
+    for call in STATE.calls:
+        if call.get("uuid") == uuid:
+            return call
+    return None
+
+
+def net_quality(window=3600):
+    """Сводка по завершённым вызовам из сети за последний час."""
+    edge = now() - window
+    done = [c for c in STATE.calls
+            if c["dir"] == "из сети" and c.get("end") and c["ts"] >= edge]
+    return {
+        "calls": len(done),
+        "bad": sum(1 for c in done if c["q"] == "bad"),
+        "warn": sum(1 for c in done if c["q"] == "warn"),
+        "drops": sum(c.get("drops", 0) for c in done),
+        "jitter_max": max((c.get("jitter_ms") or 0.0 for c in done), default=0.0),
+    }
 
 
 def parse_journal_line(line):
@@ -736,19 +919,68 @@ def parse_journal_line(line):
 
     m = RE_GROUP_TX.search(line)
     if m:
-        call = {"ts": now(), "dir": "из сети",
-                "src": int(m.group(2)), "dst": int(m.group(3))}
+        call = {"ts": now(), "dir": "из сети", "uuid": m.group(1),
+                "src": int(m.group(2)), "dst": int(m.group(3)),
+                "end": None, "frames": None, "q": "live"}
         STATE.calls.appendleft(call)
         return STATE.event(
             "call", f"вызов из сети: {call['src']} -> группа {call['dst']}", "журнал")
 
     m = RE_LOCAL_CALL.search(line)
     if m:
-        call = {"ts": now(), "dir": "в сеть",
-                "src": int(m.group(2)), "dst": int(m.group(3))}
+        call = {"ts": now(), "dir": "в сеть", "uuid": None,
+                "src": int(m.group(2)), "dst": int(m.group(3)),
+                "end": None, "frames": None, "q": "live"}
         STATE.calls.appendleft(call)
         return STATE.event(
             "call", f"вызов в сеть: {call['src']} -> группа {call['dst']}", "журнал")
+
+    m = RE_JITTER.search(line)
+    if m:
+        call = find_call(m.group(1))
+        if not call:
+            return None
+        call["target"] = max(call.get("target") or 0, int(m.group(2)))
+        call["underruns"] = max(call.get("underruns", 0), int(m.group(3)))
+        call["drops"] = max(call.get("drops", 0), int(m.group(4)))
+        call["jitter_ms"] = max(call.get("jitter_ms") or 0.0, float(m.group(5)))
+        if call.get("end"):
+            call["q"] = call_quality(call)
+        return call
+
+    m = RE_CALL_ENDED.search(line)
+    if m:
+        call = find_call(m.group(1))
+        if not call:
+            return None
+        t, frames = now(), int(m.group(3))
+        if m.group(2) is not None:
+            cid = int(m.group(2))
+            prev = CALL_FRAMES.get(cid)
+            # Тот же канал продолжился после смены говорящего — вычитаем прошлое
+            if prev and t - prev[0] < 120 and frames >= prev[1]:
+                CALL_FRAMES[cid] = (t, frames)
+                frames -= prev[1]
+            else:
+                CALL_FRAMES[cid] = (t, frames)
+        call["end"], call["frames"] = t, frames
+        call["q"] = call_quality(call)
+        if call["q"] == "bad":
+            return STATE.event(
+                "call", f"звук из сети рвался: {call['src']} -> группа {call['dst']}, "
+                        f"провалов {call.get('underruns', 0)}, "
+                        f"выброшено кадров {call.get('drops', 0)}", "журнал")
+        return call
+
+    m = RE_LOCAL_STOP.search(line)
+    if m:
+        # В строке начала нашей передачи нет uuid — сопоставляем с последней открытой
+        for call in STATE.calls:
+            if call["dir"] == "в сеть" and call.get("end") is None:
+                call.update(uuid=m.group(1), end=now(), frames=int(m.group(2)))
+                call["q"] = call_quality(call)
+                return call
+        return None
 
     m = RE_SUB_UPDATE.search(line)
     if m:
@@ -919,16 +1151,20 @@ def check_basic(headers):
         user, _, password = base64.b64decode(header[6:]).decode("utf-8").partition(":")
     except Exception:
         return False
-    # Сравнение постоянного времени: пароль короткий, утечка по таймингу реальна
-    return (hmac.compare_digest(user, DASH_USER)
-            and hmac.compare_digest(password, DASH_PASSWORD))
+    # Сравнение постоянного времени: пароль короткий, утечка по таймингу реальна.
+    # Сравниваем байты, а не строки: compare_digest падает на не-ASCII строках,
+    # и логин, набранный в русской раскладке, ронял обработчик — браузер вместо
+    # «неверный пароль» получал «Failed to open a WebSocket connection».
+    return (hmac.compare_digest(user.encode("utf-8"), DASH_USER.encode("utf-8"))
+            and hmac.compare_digest(password.encode("utf-8"), DASH_PASSWORD.encode("utf-8")))
 
 
 def check_cookie(headers):
     for raw in headers.get_all("Cookie"):
         for part in raw.split(";"):
             name, _, value = part.strip().partition("=")
-            if name == "dash" and hmac.compare_digest(value, SESSION_TOKEN):
+            if name == "dash" and hmac.compare_digest(value.encode("utf-8"),
+                                                      SESSION_TOKEN.encode("utf-8")):
                 return True
     return False
 
@@ -971,6 +1207,10 @@ async def browser_handler(ws):
             elif cmd == "station":
                 result = await station_control(req.get("action"))
                 await ws.send(json.dumps({"type": "station_result", **result},
+                                         ensure_ascii=False))
+            elif cmd == "power" and req.get("action") == "off":
+                result = await power_off()
+                await ws.send(json.dumps({"type": "power_result", **result},
                                          ensure_ascii=False))
             await broadcast()
     finally:
@@ -1026,14 +1266,16 @@ async def main():
     ):
         print(f"tetra-dash: телеметрия :{TELEMETRY_PORT}, управление :{CONTROL_PORT}, "
               f"панель {DASH_BIND}:{HTTP_PORT} ({auth_note})", flush=True)
-        load_temps()
+        load_temps(TEMP_HISTORY, TEMPS)
+        load_temps(HOST_TEMP_HISTORY, HOST_TEMPS)
         CALLSIGNS.update(load_callsigns())
         if CALLSIGNS:
             STATE.event("callsign", f"кэш позывных: {len(CALLSIGNS)} записей", "сервис")
         STATE.event("link", "сервис запущен", "сервис")
         await resync_subscribers()
         await asyncio.gather(journal_reader(), station_watcher(),
-                             callsign_resolver(), temp_poller(), tx_watchdog())
+                             callsign_resolver(), temp_poller(), host_temp_poller(),
+                             tx_watchdog())
 
 
 if __name__ == "__main__":

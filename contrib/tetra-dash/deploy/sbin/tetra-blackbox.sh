@@ -38,8 +38,12 @@
 # перед смертью просто не попадала в запись — все семь раз последний снимок
 # показывал совершенно спокойную машину.
 
-LOG=/var/log/tetra-blackbox.log
-INTERVAL=1
+# Путь, шаг и сброс на диск задаются окружением юнита. На SD-карте секундный
+# sync за полгода съедает карту, поэтому там журнал кладётся в /run (память)
+# с SYNC=0, а на диск копируется при штатной остановке — см. deploy/pi/.
+LOG=${LOG:-/var/log/tetra-blackbox.log}
+INTERVAL=${INTERVAL:-1}
+SYNC=${SYNC:-1}
 UNIT_PROC=bluestation-bs
 IFACE=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
 [ -n "$IFACE" ] || IFACE=eth0
@@ -105,7 +109,7 @@ while :; do
 
     # Без сброса на диск строка останется в кэше и при зависании пропадёт —
     # то есть ровно те секунды, ради которых всё это и затевалось.
-    sync "$LOG" 2>/dev/null
+    [ "$SYNC" = 1 ] && sync "$LOG" 2>/dev/null
 
     # --- рискованная часть, ПОСЛЕ записи основной строки ---
     #
@@ -120,9 +124,8 @@ while :; do
     drop=${drop:-$prev_drop}
     d_drop=$((drop-prev_drop)); prev_drop=$drop
     [ "$d_drop" -lt 0 ] && d_drop=0
-    printf '%s netdrop=%s
-' "$now" "$d_drop" >> "$LOG"
-    sync "$LOG" 2>/dev/null
+    printf '%s netdrop=%s\n' "$now" "$d_drop" >> "$LOG"
+    [ "$SYNC" = 1 ] && sync "$LOG" 2>/dev/null
 
     sleep "$INTERVAL"
 done

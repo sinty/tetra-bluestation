@@ -69,6 +69,9 @@ python3 -m venv ~/tetra-dash-venv && ~/tetra-dash-venv/bin/pip install websocket
 
 Единственная зависимость — `websockets` (проверено на 17.1).
 
+На Raspberry Pi / Compute Module 4 с Pluto по USB — отличия в [deploy/pi/](deploy/pi/README.md):
+сеть, управление вентилятором и бережение SD-карты.
+
 ## Безопасность
 
 Панель умеет включать и выключать передатчик, поэтому:

@@ -20,3 +20,15 @@ polkit.addRule(function (action, subject) {
         }
     }
 });
+
+// Выключение машины кнопкой в панели. Панель работает как служба, вне
+// пользовательского сеанса, поэтому по умолчанию logind требует пароль
+// администратора. Разрешаем только выключение — не перезагрузку, не сон.
+// *-multiple-sessions нужен, когда кто-то в это время зашёл по SSH.
+polkit.addRule(function (action, subject) {
+    if ((action.id === "org.freedesktop.login1.power-off" ||
+         action.id === "org.freedesktop.login1.power-off-multiple-sessions") &&
+        subject.user === "claude") {
+        return polkit.Result.YES;
+    }
+});
